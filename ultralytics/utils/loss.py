@@ -855,3 +855,189 @@ class TVPSegmentLoss(TVPDetectLoss):
         vp_loss = self.vp_criterion((vp_feats, pred_masks, proto), batch)
         cls_loss = vp_loss[0][2]
         return cls_loss, vp_loss[1]
+
+
+class DepthLoss:
+    """
+    Depth Estimation Loss.
+    
+    Combines multiple loss terms for robust depth prediction:
+    - L1 Loss: Basic depth error
+    - Scale-Invariant Loss: Handle scale ambiguity
+    - Gradient Loss: Preserve edges
+    
+    Attributes:
+        device (torch.device): Device for tensors.
+        hyp (dict): Hyperparameters for loss weights.
+    """
+
+    def __init__(self, model):
+        """
+        Initialize DepthLoss with model parameters.
+        
+        Args:
+            model: YOLO depth model instance.
+        """
+        self.device = next(model.parameters()).device
+        self.hyp = model.args  # hyperparameters
+        
+        # Loss weights (can be adjusted via hyperparameters)
+        self.lambda_l1 = self.hyp.get("lambda_l1", 1.0)
+        self.lambda_si = self.hyp.get("lambda_si", 0.5)
+        self.lambda_grad = self.hyp.get("lambda_grad", 0.1)
+
+    def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Calculate depth loss.
+        
+        Args:
+            preds (Tensor): Predicted depth map, shape (B, 1, H, W) or (B, C, H, W).
+            batch (dict): Batch data with 'depth' key.
+        
+        Returns:
+            tuple: (total_loss * batch_size, loss_items) for consistency with other losses.
+        """
+        batch_size = preds.shape[0]
+        pred_depth = preds  # (B, C, H, W)
+        
+        # Get ground truth depth
+        if "depth" not in batch:
+            # If no depth in batch, return zero loss
+            loss = torch.zeros(1, device=self.device, requires_grad=True)
+            loss_items = torch.zeros(3, device=self.device)
+            return loss, loss_items
+        
+        gt_depth = batch["depth"].to(self.device).float()  # (B, 1, H, W)
+        
+        # Ensure shape compatibility
+        if pred_depth.shape != gt_depth.shape:
+            # Resize predictions to match GT size
+            if pred_depth.shape[1] != 1:
+                # If multiple channels, take first channel or average
+                pred_depth = pred_depth[:, :1, :, :]
+            
+            if pred_depth.shape[-2:] != gt_depth.shape[-2:]:
+                pred_depth = F.interpolate(
+                    pred_depth,
+                    size=gt_depth.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                )
+        
+        # Valid depth mask (exclude invalid values, typically <= 0)
+        mask = gt_depth > 0
+        valid_count = mask.sum().float()
+        
+        if valid_count == 0:
+            # If no valid depth values in batch
+            loss = torch.zeros(1, device=self.device, requires_grad=True)
+            loss_items = torch.zeros(3, device=self.device)
+            return loss, loss_items
+        
+        # 1. L1 Loss
+        l1_loss = F.l1_loss(pred_depth[mask], gt_depth[mask])
+        
+        # 2. Scale-Invariant Logarithmic Loss
+        si_loss = self.scale_invariant_loss(pred_depth, gt_depth, mask)
+        
+        # 3. Gradient Loss (Edge-aware)
+        grad_loss = self.gradient_loss(pred_depth, gt_depth, mask)
+        
+        # Weighted total loss
+        total_loss = (
+            self.lambda_l1 * l1_loss +
+            self.lambda_si * si_loss +
+            self.lambda_grad * grad_loss
+        )
+        
+        # Loss items for logging (follow other loss functions' convention)
+        loss_items = torch.stack([
+            l1_loss.detach(),
+            si_loss.detach(),
+            grad_loss.detach()
+        ])
+        
+        # Multiply by batch_size for consistency with other losses
+        return total_loss * batch_size, loss_items
+
+    def scale_invariant_loss(self, pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Scale-Invariant Logarithmic Loss.
+        
+        This loss is invariant to global scale shifts in depth prediction.
+        Reference: Eigen et al., "Depth Map Prediction from a Single Image using a Multi-Scale Deep Network"
+        
+        Args:
+            pred (torch.Tensor): Predicted depth.
+            gt (torch.Tensor): Ground truth depth.
+            mask (torch.Tensor): Valid depth mask.
+        
+        Returns:
+            torch.Tensor: Scale-invariant loss value.
+        """
+        # For normalized depth [0, 1], add small offset to avoid log(0)
+        # Shift range from [0, 1] to [0.1, 1.1] to make log more stable
+        epsilon = 0.1
+        pred_shifted = pred[mask] + epsilon
+        gt_shifted = gt[mask] + epsilon
+        
+        # Log transform with numerical stability
+        pred_log = torch.log(pred_shifted)
+        gt_log = torch.log(gt_shifted)
+        
+        diff = pred_log - gt_log
+        
+        # Scale-invariant term: sqrt(mean(diff^2) - 0.5 * mean(diff)^2)
+        mean_diff_sq = (diff ** 2).mean()
+        mean_diff = diff.mean()
+        
+        si_loss = torch.sqrt(torch.clamp(
+            mean_diff_sq - 0.5 * (mean_diff ** 2),
+            min=0.0  # Prevent negative values under sqrt
+        ))
+        
+        return si_loss
+
+    def gradient_loss(self, pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Gradient Loss for edge preservation.
+        
+        Encourages the predicted depth to have similar gradients as ground truth depth.
+        
+        Args:
+            pred (torch.Tensor): Predicted depth (B, 1, H, W).
+            gt (torch.Tensor): Ground truth depth (B, 1, H, W).
+            mask (torch.Tensor): Valid depth mask (B, 1, H, W).
+        
+        Returns:
+            torch.Tensor: Gradient loss value.
+        """
+        # Compute gradients
+        pred_grad_x = torch.abs(pred[..., :-1] - pred[..., 1:])
+        pred_grad_y = torch.abs(pred[..., :-1, :] - pred[..., 1:, :])
+        
+        gt_grad_x = torch.abs(gt[..., :-1] - gt[..., 1:])
+        gt_grad_y = torch.abs(gt[..., :-1, :] - gt[..., 1:, :])
+        
+        # Create corresponding masks
+        mask_x = mask[..., :-1] & mask[..., 1:]
+        mask_y = mask[..., :-1, :] & mask[..., 1:, :]
+        
+        grad_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        count = 0
+        
+        # X direction gradient loss
+        if mask_x.sum() > 0:
+            grad_loss = grad_loss + F.l1_loss(pred_grad_x[mask_x], gt_grad_x[mask_x])
+            count += 1
+        
+        # Y direction gradient loss
+        if mask_y.sum() > 0:
+            grad_loss = grad_loss + F.l1_loss(pred_grad_y[mask_y], gt_grad_y[mask_y])
+            count += 1
+        
+        # Average over directions
+        if count > 0:
+            grad_loss = grad_loss / count
+        
+        return grad_loss

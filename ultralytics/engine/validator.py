@@ -248,7 +248,16 @@ class BaseValidator:
             if RANK > 0:
                 return
             results = {**stats, **trainer.label_loss_items(loss.cpu() / len(self.dataloader), prefix="val")}
-            return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats
+            # Convert all results to scalars
+            scalar_results = {}
+            for k, v in results.items():
+                if isinstance(v, torch.Tensor):
+                    if v.numel() == 1:
+                        v = v.item()
+                    else:
+                        v = v.mean().item()  # For multi-element tensors, take the mean
+                scalar_results[k] = round(float(v), 5)
+            return scalar_results
         else:
             if RANK > 0:
                 return stats

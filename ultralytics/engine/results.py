@@ -205,6 +205,7 @@ class Results(SimpleClass, DataExportMixin):
         probs (Probs | None): Classification probabilities.
         keypoints (Keypoints | None): Detected keypoints.
         obb (OBB | None): Oriented bounding boxes.
+        depth (Depth | None): Depth map from monocular depth estimation.
         speed (dict): Dictionary containing inference speed information.
         names (dict): Dictionary mapping class indices to class names.
         path (str): Path to the input image file.
@@ -247,6 +248,7 @@ class Results(SimpleClass, DataExportMixin):
         probs: torch.Tensor | None = None,
         keypoints: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
+        depth: torch.Tensor | None = None,
         speed: dict[str, float] | None = None,
     ) -> None:
         """
@@ -261,6 +263,7 @@ class Results(SimpleClass, DataExportMixin):
             probs (torch.Tensor | None): A 1D tensor of probabilities of each class for classification task.
             keypoints (torch.Tensor | None): A 2D tensor of keypoint coordinates for each detection.
             obb (torch.Tensor | None): A 2D tensor of oriented bounding box coordinates for each detection.
+            depth (torch.Tensor | None): A 2D tensor of depth map for monocular depth estimation task.
             speed (dict | None): A dictionary containing preprocess, inference, and postprocess speeds (ms/image).
 
         Examples:
@@ -283,11 +286,12 @@ class Results(SimpleClass, DataExportMixin):
         self.probs = Probs(probs) if probs is not None else None
         self.keypoints = Keypoints(keypoints, self.orig_shape) if keypoints is not None else None
         self.obb = OBB(obb, self.orig_shape) if obb is not None else None
+        self.depth = Depth(depth, self.orig_shape) if depth is not None else None
         self.speed = speed if speed is not None else {"preprocess": None, "inference": None, "postprocess": None}
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb"
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "depth"
 
     def __getitem__(self, idx):
         """
@@ -331,12 +335,14 @@ class Results(SimpleClass, DataExportMixin):
         probs: torch.Tensor | None = None,
         obb: torch.Tensor | None = None,
         keypoints: torch.Tensor | None = None,
+        depth: torch.Tensor | None = None,
     ):
         """
         Update the Results object with new detection data.
 
-        This method allows updating the boxes, masks, probabilities, and oriented bounding boxes (OBB) of the
-        Results object. It ensures that boxes are clipped to the original image shape.
+        This method allows updating the boxes, masks, probabilities, oriented bounding boxes (OBB), 
+        keypoints, and depth maps of the Results object. It ensures that boxes are clipped to the 
+        original image shape.
 
         Args:
             boxes (torch.Tensor | None): A tensor of shape (N, 6) containing bounding box coordinates and
@@ -345,6 +351,7 @@ class Results(SimpleClass, DataExportMixin):
             probs (torch.Tensor | None): A tensor of shape (num_classes,) containing class probabilities.
             obb (torch.Tensor | None): A tensor of shape (N, 5) containing oriented bounding box coordinates.
             keypoints (torch.Tensor | None): A tensor of shape (N, 17, 3) containing keypoints.
+            depth (torch.Tensor | None): A tensor of shape (H, W) or (1, H, W) containing depth map.
 
         Examples:
             >>> results = model("image.jpg")
@@ -361,6 +368,8 @@ class Results(SimpleClass, DataExportMixin):
             self.obb = OBB(obb, self.orig_shape)
         if keypoints is not None:
             self.keypoints = Keypoints(keypoints, self.orig_shape)
+        if depth is not None:
+            self.depth = Depth(depth, self.orig_shape)
 
     def _apply(self, fn: str, *args, **kwargs):
         """
@@ -492,6 +501,8 @@ class Results(SimpleClass, DataExportMixin):
         filename: str | None = None,
         color_mode: str = "class",
         txt_color: tuple[int, int, int] = (255, 255, 255),
+        depth_vis_mode: str = "overlay",
+        depth_alpha: float = 0.7,
     ) -> np.ndarray:
         """
         Plot detection results on an input RGB image.
@@ -515,6 +526,11 @@ class Results(SimpleClass, DataExportMixin):
             filename (str | None): Filename to save image if save is True.
             color_mode (str): Specify the color mode, e.g., 'instance' or 'class'.
             txt_color (tuple[int, int, int]): Specify the RGB text color for classification task.
+            depth_vis_mode (str): Depth visualization mode for depth estimation task:
+                - 'overlay': Overlay depth map on original image (default)
+                - 'side_by_side': Show original and depth map side by side
+                - 'depth_only': Show only the depth map
+            depth_alpha (float): Depth map transparency for 'overlay' mode (0.0=transparent, 1.0=opaque). Default is 0.7.
 
         Returns:
             (np.ndarray): Annotated image as a numpy array.
@@ -524,6 +540,11 @@ class Results(SimpleClass, DataExportMixin):
             >>> for result in results:
             >>>     im = result.plot()
             >>>     im.show()
+            >>> # For depth estimation
+            >>> depth_results = depth_model("image.jpg")
+            >>> depth_only = depth_results[0].plot(depth_vis_mode="depth_only")
+            >>> side_by_side = depth_results[0].plot(depth_vis_mode="side_by_side")
+            >>> overlay = depth_results[0].plot(depth_vis_mode="overlay", depth_alpha=0.5)
         """
         assert color_mode in {"instance", "class"}, f"Expected color_mode='instance' or 'class', not {color_mode}."
         if img is None and isinstance(self.orig_img, torch.Tensor):
@@ -602,6 +623,101 @@ class Results(SimpleClass, DataExportMixin):
                     kpt_color=colors(i, True) if color_mode == "instance" else None,
                 )
 
+        # Plot Depth results
+        if self.depth is not None:
+            import cv2
+            assert depth_vis_mode in {"overlay", "side_by_side", "depth_only"}, \
+                f"depth_vis_mode must be 'overlay', 'side_by_side', or 'depth_only', not '{depth_vis_mode}'"
+            
+            if depth_vis_mode == "overlay":
+                # Overlay depth map on original image
+                # depth.data is already in [0, 255] range from predict.postprocess, so normalize=False
+                annotator.depth(self.depth.data, alpha=depth_alpha, normalize=False)
+            
+            elif depth_vis_mode == "depth_only":
+                # Show only depth map as grayscale
+                depth_data = self.depth.data
+                if hasattr(depth_data, 'cpu'):
+                    depth_data = depth_data.cpu().numpy()
+                depth_data = depth_data.squeeze()  # Ensure 2D
+                
+                # Get image size
+                orig_img = annotator.result() if not pil else np.asarray(annotator.im)
+                h, w = orig_img.shape[:2]
+                
+                # Convert to float32 for processing
+                depth_data = depth_data.astype(np.float32)
+                
+                # Resize depth to match image size if needed
+                if depth_data.shape[:2] != (h, w):
+                    depth_resized = cv2.resize(depth_data, (w, h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    depth_resized = depth_data
+                
+                # Use fixed depth range [0, 255] for consistent visualization
+                depth_min = 0.0
+                depth_max = 255.0
+                
+                # Normalize depth
+                depth_clipped = np.clip(depth_resized, depth_min, depth_max)
+                depth_norm = (depth_clipped - depth_min) / (depth_max - depth_min)
+                
+                # Convert to grayscale (3-channel for consistency)
+                depth_gray = (depth_norm * 255).astype(np.uint8)
+                depth_gray_3ch = cv2.cvtColor(depth_gray, cv2.COLOR_GRAY2BGR)
+                
+                # Update annotator image
+                if pil:
+                    from PIL import Image
+                    annotator.im = Image.fromarray(depth_gray_3ch)
+                else:
+                    annotator.im = depth_gray_3ch
+            
+            elif depth_vis_mode == "side_by_side":
+                # Show original image and depth map side by side
+                depth_data = self.depth.data
+                if hasattr(depth_data, 'cpu'):
+                    depth_data = depth_data.cpu().numpy()
+                depth_data = depth_data.squeeze()  # Ensure 2D
+                
+                # Get original image
+                orig_img = annotator.result() if not pil else np.asarray(annotator.im)
+                h, w = orig_img.shape[:2]
+                
+                # Convert to float32 for processing
+                depth_data = depth_data.astype(np.float32)
+                
+                # Resize depth to match image size if needed
+                if depth_data.shape[:2] != (h, w):
+                    depth_resized = cv2.resize(depth_data, (w, h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    depth_resized = depth_data
+                
+                # Use fixed depth range [0, 255] for consistent visualization
+                depth_min = 0.0
+                depth_max = 255.0
+                
+                # Normalize depth
+                depth_clipped = np.clip(depth_resized, depth_min, depth_max)
+                depth_norm = (depth_clipped - depth_min) / (depth_max - depth_min)
+                
+                # Apply turbo colormap (use matplotlib for consistency with val_batch)
+                import matplotlib.cm
+                depth_colormap = matplotlib.cm.get_cmap("turbo")
+                depth_colored = (depth_colormap(depth_norm)[:, :, :3] * 255).astype(np.uint8)
+                # Convert RGB to BGR for OpenCV
+                depth_colored = cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR)
+                
+                # Concatenate horizontally
+                combined = np.hstack([orig_img, depth_colored])
+                
+                # Update annotator image
+                if pil:
+                    from PIL import Image
+                    annotator.im = Image.fromarray(combined)
+                else:
+                    annotator.im = combined
+
         # Show results
         if show:
             annotator.show(self.path)
@@ -662,14 +778,16 @@ class Results(SimpleClass, DataExportMixin):
 
     def verbose(self) -> str:
         """
-        Return a log string for each task in the results, detailing detection and classification outcomes.
+        Return a log string for each task in the results, detailing detection, classification, and depth outcomes.
 
-        This method generates a human-readable string summarizing the detection and classification results. It includes
-        the number of detections for each class and the top probabilities for classification tasks.
+        This method generates a human-readable string summarizing the detection, classification, and depth results.
+        It includes the number of detections for each class, top probabilities for classification tasks, and depth
+        statistics for depth estimation tasks.
 
         Returns:
             (str): A formatted string containing a summary of the results. For detection tasks, it includes the
                 number of detections per class. For classification tasks, it includes the top 5 class probabilities.
+                For depth tasks, it includes statistics like min/max/mean depth values.
 
         Examples:
             >>> results = model("path/to/image.jpg")
@@ -677,12 +795,27 @@ class Results(SimpleClass, DataExportMixin):
             >>>     print(result.verbose())
             2 persons, 1 car, 3 traffic lights,
             dog 0.92, cat 0.78, horse 0.64,
+            depth: min=0.12, max=8.45, mean=2.34,
 
         Notes:
             - If there are no detections, the method returns "(no detections), " for detection tasks.
             - For classification tasks, it returns the top 5 class probabilities and their corresponding class names.
+            - For depth tasks, it returns min/max/mean depth statistics.
             - The returned string is comma-separated and ends with a comma and a space.
         """
+        # Handle depth task
+        if self.depth is not None:
+            depth_data = self.depth.data
+            if isinstance(depth_data, torch.Tensor):
+                depth_min = depth_data.min().item()
+                depth_max = depth_data.max().item()
+                depth_mean = depth_data.mean().item()
+            else:
+                depth_min = float(depth_data.min())
+                depth_max = float(depth_data.max())
+                depth_mean = float(depth_data.mean())
+            return f"depth: min={depth_min:.2f}, max={depth_max:.2f}, mean={depth_mean:.2f}, "
+        
         boxes = self.obb if self.obb is not None else self.boxes
         if len(self) == 0:
             return "" if self.probs is not None else "(no detections), "
@@ -1654,3 +1787,166 @@ class OBB(BaseTensor):
             if isinstance(x, torch.Tensor)
             else np.stack([x.min(1), y.min(1), x.max(1), y.max(1)], -1)
         )
+
+
+class Depth(BaseTensor):
+    """
+    A class for storing and manipulating depth estimation maps.
+
+    This class extends BaseTensor and provides functionality for handling depth maps from
+    monocular depth estimation models. It includes methods for normalizing, denormalizing,
+    and visualizing depth data.
+
+    Attributes:
+        data (torch.Tensor | np.ndarray): The raw depth map tensor with shape (height, width).
+        orig_shape (tuple[int, int]): Original image shape in (height, width) format.
+
+    Methods:
+        cpu: Return a copy of the depth map on CPU memory.
+        numpy: Return a copy of the depth map as a numpy array.
+        cuda: Return a copy of the depth map on GPU memory.
+        to: Return a copy of the depth map with specified device and dtype.
+
+    Examples:
+        >>> import torch
+        >>> from ultralytics.engine.results import Depth
+        >>> depth_data = torch.rand(480, 640)  # Random depth map
+        >>> orig_shape = (480, 640)
+        >>> depth = Depth(depth_data, orig_shape)
+        >>> cpu_depth = depth.cpu()
+        >>> numpy_depth = depth.numpy()
+    """
+
+    def __init__(self, depth: torch.Tensor | np.ndarray, orig_shape: tuple[int, int]) -> None:
+        """
+        Initialize the Depth class with depth map data and original image shape.
+
+        Args:
+            depth (torch.Tensor | np.ndarray): Depth map data with shape (height, width).
+                Values can be normalized [0, 1] or in original depth range.
+            orig_shape (tuple[int, int]): Original image shape as (height, width).
+
+        Examples:
+            >>> import torch
+            >>> depth_map = torch.rand(480, 640)
+            >>> depth = Depth(depth_map, orig_shape=(480, 640))
+            >>> print(depth.data.shape)
+            torch.Size([480, 640])
+        """
+        if depth.ndim == 2:
+            # Ensure consistent shape (height, width)
+            pass
+        elif depth.ndim == 3 and depth.shape[0] == 1:
+            # If shape is (1, height, width), squeeze to (height, width)
+            depth = depth.squeeze(0)
+        
+        super().__init__(depth, orig_shape)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """
+        Return the shape of the depth map (height, width).
+
+        Returns:
+            (tuple[int, ...]): Shape of the depth data.
+
+        Examples:
+            >>> depth = Depth(torch.rand(480, 640), orig_shape=(480, 640))
+            >>> print(depth.shape)
+            (480, 640)
+        """
+        return self.data.shape
+
+    def numpy(self):
+        """
+        Return a copy of the depth map as a numpy array.
+
+        Returns:
+            (Depth): A new Depth object with the data as a numpy array.
+
+        Examples:
+            >>> depth = Depth(torch.rand(480, 640), orig_shape=(480, 640))
+            >>> numpy_depth = depth.numpy()
+            >>> print(type(numpy_depth.data))
+            <class 'numpy.ndarray'>
+        """
+        return self if isinstance(self.data, np.ndarray) else self.__class__(self.data.numpy(), self.orig_shape)
+
+    def cpu(self):
+        """
+        Return a copy of the depth map on CPU memory.
+
+        Returns:
+            (Depth): A new Depth object with data on CPU.
+
+        Examples:
+            >>> depth = Depth(torch.rand(480, 640).cuda(), orig_shape=(480, 640))
+            >>> cpu_depth = depth.cpu()
+            >>> print(cpu_depth.data.device)
+            cpu
+        """
+        return self if isinstance(self.data, np.ndarray) else self.__class__(self.data.cpu(), self.orig_shape)
+
+    def cuda(self):
+        """
+        Move the depth map to GPU memory.
+
+        Returns:
+            (Depth): A new Depth object with data on CUDA device.
+
+        Examples:
+            >>> depth = Depth(torch.rand(480, 640), orig_shape=(480, 640))
+            >>> cuda_depth = depth.cuda()
+            >>> print(cuda_depth.data.device)
+            cuda:0
+        """
+        return self.__class__(torch.as_tensor(self.data).cuda(), self.orig_shape)
+
+    def to(self, *args, **kwargs):
+        """
+        Move the depth map to specified device and/or dtype.
+
+        Args:
+            *args (Any): Variable length argument list for torch.Tensor.to().
+            **kwargs (Any): Arbitrary keyword arguments for torch.Tensor.to().
+
+        Returns:
+            (Depth): A new Depth object with data on specified device/dtype.
+
+        Examples:
+            >>> depth = Depth(torch.rand(480, 640), orig_shape=(480, 640))
+            >>> cuda_depth = depth.to("cuda")
+            >>> float16_depth = depth.to(dtype=torch.float16)
+        """
+        return self.__class__(torch.as_tensor(self.data).to(*args, **kwargs), self.orig_shape)
+
+    def __len__(self) -> int:
+        """
+        Return the first dimension size (height) of the depth map.
+
+        Returns:
+            (int): Height of the depth map.
+
+        Examples:
+            >>> depth = Depth(torch.rand(480, 640), orig_shape=(480, 640))
+            >>> print(len(depth))
+            480
+        """
+        return self.data.shape[0]
+
+    def __getitem__(self, idx):
+        """
+        Index into the depth map.
+
+        Args:
+            idx (int | slice | torch.Tensor): Index or slice to retrieve from depth map.
+
+        Returns:
+            (Depth): A new Depth object with the indexed data.
+
+        Examples:
+            >>> depth = Depth(torch.rand(480, 640), orig_shape=(480, 640))
+            >>> row = depth[0]  # Get first row
+            >>> patch = depth[100:200, 100:200]  # Get patch
+        """
+        return self.__class__(self.data[idx], self.orig_shape)

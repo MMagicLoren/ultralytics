@@ -19,6 +19,7 @@ from ultralytics.nn.tasks import (
     WorldModel,
     YOLOEModel,
     YOLOESegModel,
+    DepthModel,
 )
 from ultralytics.utils import ROOT, YAML
 
@@ -122,6 +123,12 @@ class YOLO(Model):
                 "validator": yolo.obb.OBBValidator,
                 "predictor": yolo.obb.OBBPredictor,
             },
+            "depth": {  # 新增depth任务
+                "model": DepthModel,
+                "trainer": yolo.depth.DepthTrainer,
+                "validator": yolo.depth.DepthValidator,
+                "predictor": yolo.depth.DepthPredictor,
+        },
         }
 
 

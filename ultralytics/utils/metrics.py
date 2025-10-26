@@ -1594,3 +1594,194 @@ class OBBMetrics(DetMetrics):
         DetMetrics.__init__(self, names)
         # TODO: probably remove task as well
         self.task = "obb"
+
+
+class DepthMetrics(SimpleClass, DataExportMixin):
+    """
+    Metrics for depth estimation evaluation.
+    
+    Computes standard depth metrics:
+    - MAE: Mean Absolute Error
+    - RMSE: Root Mean Square Error
+    - AbsRel: Absolute Relative Error
+    - δ: Threshold accuracy (δ < 1.25, 1.25², 1.25³)
+    
+    Attributes:
+        save_dir (Path): Directory to save results.
+        on_plot (callable): Callback function for plotting.
+        speed (dict): Processing speed metrics.
+        task (str): Task type, set to 'depth'.
+    """
+
+    def __init__(self, save_dir=Path("."), on_plot=None):
+        """
+        Initialize DepthMetrics.
+        
+        Args:
+            save_dir (Path, optional): Directory to save results.
+            on_plot (callable, optional): Callback for plotting.
+        """
+        self.save_dir = save_dir
+        self.on_plot = on_plot
+        self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
+        self.task = "depth"
+        self.reset()
+
+    def reset(self):
+        """Reset all metrics to initial state."""
+        self.mae_sum = 0.0
+        self.rmse_sum = 0.0
+        self.abs_rel_sum = 0.0
+        self.sq_rel_sum = 0.0
+        self.delta1_sum = 0.0
+        self.delta2_sum = 0.0
+        self.delta3_sum = 0.0
+        self.count = 0
+
+    def process(self, pred, gt):
+        """
+        Update metrics with a batch of predictions.
+        
+        Args:
+            pred (Tensor | np.ndarray): Predicted depth (H, W), can be torch tensor or numpy array.
+            gt (Tensor | np.ndarray): Ground truth depth (H, W), can be torch tensor or numpy array.
+        """
+        # Convert to numpy if needed
+        if isinstance(pred, torch.Tensor):
+            pred = pred.cpu().numpy()
+        if isinstance(gt, torch.Tensor):
+            gt = gt.cpu().numpy()
+        
+        # Ensure same shape
+        if pred.shape != gt.shape:
+            from ultralytics.utils.ops import scale_coords
+            # If shapes don't match, skip (should be handled by validator)
+            return
+        
+        # Valid mask (depth > 0)
+        mask = gt > 0
+        if mask.sum() == 0:
+            return
+
+        pred_masked = pred[mask]
+        gt_masked = gt[mask]
+
+        # MAE (Mean Absolute Error)
+        self.mae_sum += np.abs(pred_masked - gt_masked).mean()
+
+        # RMSE (Root Mean Square Error)
+        self.rmse_sum += np.sqrt(((pred_masked - gt_masked) ** 2).mean())
+
+        # Absolute Relative Error
+        self.abs_rel_sum += (np.abs(pred_masked - gt_masked) / (gt_masked + 1e-8)).mean()
+
+        # Square Relative Error
+        self.sq_rel_sum += (((pred_masked - gt_masked) ** 2) / (gt_masked + 1e-8)).mean()
+
+        # Threshold accuracy (δ < threshold)
+        ratio = np.maximum(pred_masked / (gt_masked + 1e-8), gt_masked / (pred_masked + 1e-8))
+        self.delta1_sum += (ratio < 1.25).astype(float).mean()
+        self.delta2_sum += (ratio < 1.25 ** 2).astype(float).mean()
+        self.delta3_sum += (ratio < 1.25 ** 3).astype(float).mean()
+
+        self.count += 1
+
+    @property
+    def results_dict(self) -> dict[str, float]:
+        """
+        Return computed metrics as dictionary.
+        
+        Returns:
+            (dict[str, float]): Dictionary with all computed depth metrics.
+        """
+        n = max(self.count, 1)
+        return {
+            "mae": self.mae_sum / n,
+            "rmse": self.rmse_sum / n,
+            "abs_rel": self.abs_rel_sum / n,
+            "sq_rel": self.sq_rel_sum / n,
+            "delta1": self.delta1_sum / n,
+            "delta2": self.delta2_sum / n,
+            "delta3": self.delta3_sum / n,
+            "fitness": self.fitness,  # Add fitness for best.pt selection
+        }
+
+    @property
+    def fitness(self) -> float:
+        """
+        Return model fitness as a weighted combination of depth metrics.
+        
+        Fitness is computed as a combination of accuracy metrics (delta) and error metrics (MAE, RMSE).
+        Higher fitness is better.
+        
+        Formula: delta1 * 0.7 - (MAE_normalized * 0.2 + RMSE_normalized * 0.1)
+        - delta1 (0-1): Primary metric, higher is better
+        - MAE normalized (0-1): Lower is better, so negated
+        - RMSE normalized (0-1): Lower is better, so negated
+        
+        Returns:
+            (float): Fitness value, higher is better.
+        """
+        n = max(self.count, 1)
+        delta1 = self.delta1_sum / n
+        mae = self.mae_sum / n
+        rmse = self.rmse_sum / n
+        
+        # Normalize MAE and RMSE to [0, 1] range (assuming max values for normalization)
+        # For normalized depth [0, 1], MAE/RMSE max is theoretically 1.0
+        mae_norm = min(mae, 1.0)
+        rmse_norm = min(rmse, 1.0)
+        
+        # Weighted combination: prioritize delta1 (accuracy), penalize MAE and RMSE (error)
+        # delta1: 70%, MAE: 20%, RMSE: 10%
+        fitness = delta1 * 0.7 - mae_norm * 0.2 - rmse_norm * 0.1
+        
+        return float(fitness)
+
+    @property
+    def keys(self) -> list[str]:
+        """Return a list of keys for accessing metrics."""
+        return [
+            "metrics/MAE",
+            "metrics/RMSE",
+            "metrics/AbsRel",
+            "metrics/δ<1.25",
+            "metrics/δ<1.25²",
+            "metrics/δ<1.25³",
+        ]
+
+    def __str__(self) -> str:
+        """Return string representation of metrics."""
+        d = self.results_dict
+        return (
+            f"MAE: {d['mae']:.4f}, "
+            f"RMSE: {d['rmse']:.4f}, "
+            f"AbsRel: {d['abs_rel']:.4f}, "
+            f"δ1: {d['delta1']:.4f}, "
+            f"δ2: {d['delta2']:.4f}, "
+            f"δ3: {d['delta3']:.4f}"
+        )
+
+    def summary(self, normalize: bool = True, decimals: int = 5) -> list[dict[str, float]]:
+        """
+        Generate a summary of depth metrics as a list of dictionaries.
+        
+        Args:
+            normalize (bool): Whether to normalize metrics (default True, already normalized 0-1).
+            decimals (int): Number of decimal places to round to.
+        
+        Returns:
+            (list[dict[str, float]]): A list with one dictionary containing all metrics.
+        """
+        d = self.results_dict
+        return [
+            {
+                "MAE": round(d["mae"], decimals),
+                "RMSE": round(d["rmse"], decimals),
+                "AbsRel": round(d["abs_rel"], decimals),
+                "SqRel": round(d["sq_rel"], decimals),
+                "δ<1.25": round(d["delta1"], decimals),
+                "δ<1.25²": round(d["delta2"], decimals),
+                "δ<1.25³": round(d["delta3"], decimals),
+            }
+        ]

@@ -24,9 +24,12 @@ from .augment import (
     Compose,
     Format,
     LetterBox,
+    DirectResize,
+    NormalizeImage,
     RandomLoadText,
     classify_augmentations,
     classify_transforms,
+    depth_transforms,
     v8_transforms,
 )
 from .base import BaseDataset
@@ -78,15 +81,18 @@ class YOLODataset(BaseDataset):
 
         Args:
             data (dict, optional): Dataset configuration dictionary.
-            task (str): Task type, one of 'detect', 'segment', 'pose', or 'obb'.
+            task (str): Task type, one of 'detect', 'segment', 'pose', 'obb', or 'depth'.
             *args (Any): Additional positional arguments for the parent class.
             **kwargs (Any): Additional keyword arguments for the parent class.
         """
         self.use_segments = task == "segment"
         self.use_keypoints = task == "pose"
         self.use_obb = task == "obb"
+        self.use_depth = task == "depth"
         self.data = data
         assert not (self.use_segments and self.use_keypoints), "Can not use both segments and keypoints."
+        assert not (self.use_depth and any([self.use_segments, self.use_keypoints, self.use_obb])), \
+            "Depth task cannot be combined with other tasks."
         super().__init__(*args, channels=self.data.get("channels", 3), **kwargs)
 
     def cache_labels(self, path: Path = Path("./labels.cache")) -> dict:
@@ -103,55 +109,90 @@ class YOLODataset(BaseDataset):
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
         desc = f"{self.prefix}Scanning {path.parent / path.stem}..."
         total = len(self.im_files)
-        nkpt, ndim = self.data.get("kpt_shape", (0, 0))
-        if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
-            raise ValueError(
-                "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
-                "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
-            )
-        with ThreadPool(NUM_THREADS) as pool:
-            results = pool.imap(
-                func=verify_image_label,
-                iterable=zip(
-                    self.im_files,
-                    self.label_files,
-                    repeat(self.prefix),
-                    repeat(self.use_keypoints),
-                    repeat(len(self.data["names"])),
-                    repeat(nkpt),
-                    repeat(ndim),
-                    repeat(self.single_cls),
-                ),
-            )
-            pbar = TQDM(results, desc=desc, total=total)
-            for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
-                nm += nm_f
-                nf += nf_f
-                ne += ne_f
-                nc += nc_f
-                if im_file:
-                    x["labels"].append(
-                        {
-                            "im_file": im_file,
-                            "shape": shape,
-                            "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
-                            "segments": segments,
-                            "keypoints": keypoint,
-                            "normalized": True,
-                            "bbox_format": "xywh",
-                        }
-                    )
-                if msg:
-                    msgs.append(msg)
-                pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
-            pbar.close()
+        
+        # For depth task, skip label verification
+        if self.use_depth:
+            with ThreadPool(NUM_THREADS) as pool:
+                results = pool.imap(
+                    func=verify_image,
+                    iterable=(((im_file, 0), self.prefix) for im_file in self.im_files),
+                )
+                pbar = TQDM(results, desc=desc, total=total)
+                for (im_file, cls), nf_f, nc_f, msg in pbar:
+                    if im_file:
+                        nf += nf_f
+                        nc += nc_f
+                        x["labels"].append(
+                            {
+                                "im_file": im_file,
+                                "shape": (480, 640),  # Default shape, will be loaded from image
+                                "cls": np.zeros((0,), dtype=np.int64),  # No classes for depth
+                                "normalized": False,
+                            }
+                        )
+                    else:
+                        nm += 1
+                    if msg:
+                        msgs.append(msg)
+                    pbar.desc = f"{desc} {nf} images, {nm} missing"
+                pbar.close()
+        else:
+            # Original label verification for detection/segmentation/pose/obb tasks
+            nkpt, ndim = self.data.get("kpt_shape", (0, 0))
+            if self.use_keypoints and (nkpt <= 0 or ndim not in {2, 3}):
+                raise ValueError(
+                    "'kpt_shape' in data.yaml missing or incorrect. Should be a list with [number of "
+                    "keypoints, number of dims (2 for x,y or 3 for x,y,visible)], i.e. 'kpt_shape: [17, 3]'"
+                )
+            with ThreadPool(NUM_THREADS) as pool:
+                results = pool.imap(
+                    func=verify_image_label,
+                    iterable=zip(
+                        self.im_files,
+                        self.label_files,
+                        repeat(self.prefix),
+                        repeat(self.use_keypoints),
+                        repeat(len(self.data["names"])),
+                        repeat(nkpt),
+                        repeat(ndim),
+                        repeat(self.single_cls),
+                    ),
+                )
+                pbar = TQDM(results, desc=desc, total=total)
+                for im_file, lb, shape, segments, keypoint, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                    nm += nm_f
+                    nf += nf_f
+                    ne += ne_f
+                    nc += nc_f
+                    if im_file:
+                        x["labels"].append(
+                            {
+                                "im_file": im_file,
+                                "shape": shape,
+                                "cls": lb[:, 0:1],  # n, 1
+                                "bboxes": lb[:, 1:],  # n, 4
+                                "segments": segments,
+                                "keypoints": keypoint,
+                                "normalized": True,
+                                "bbox_format": "xywh",
+                            }
+                        )
+                    if msg:
+                        msgs.append(msg)
+                    pbar.desc = f"{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt"
+                pbar.close()
 
         if msgs:
             LOGGER.info("\n".join(msgs))
         if nf == 0:
             LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
-        x["hash"] = get_hash(self.label_files + self.im_files)
+        
+        # For depth task, only hash image files; for other tasks, hash both label and image files
+        if self.use_depth:
+            x["hash"] = get_hash(self.im_files)
+        else:
+            x["hash"] = get_hash(self.label_files + self.im_files)
+        
         x["results"] = nf, nm, ne, nc, len(self.im_files)
         x["msgs"] = msgs  # warnings
         save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
@@ -166,12 +207,18 @@ class YOLODataset(BaseDataset):
         Returns:
             (list[dict]): List of label dictionaries, each containing information about an image and its annotations.
         """
-        self.label_files = img2label_paths(self.im_files)
-        cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
+        # For depth task, don't use label files; for other tasks, generate label file paths
+        if self.use_depth:
+            self.label_files = []  # No label files for depth task
+            cache_path = Path(self.im_files[0]).parent.with_suffix(".cache")
+        else:
+            self.label_files = img2label_paths(self.im_files)
+            cache_path = Path(self.label_files[0]).parent.with_suffix(".cache")
+        
         try:
             cache, exists = load_dataset_cache_file(cache_path), True  # attempt to load a *.cache file
             assert cache["version"] == DATASET_CACHE_VERSION  # matches current version
-            assert cache["hash"] == get_hash(self.label_files + self.im_files)  # identical hash
+            assert cache["hash"] == get_hash(self.label_files + self.im_files if not self.use_depth else self.im_files)  # identical hash
         except (FileNotFoundError, AssertionError, AttributeError, ModuleNotFoundError):
             cache, exists = self.cache_labels(cache_path), False  # run cache ops
 
@@ -192,19 +239,21 @@ class YOLODataset(BaseDataset):
             )
         self.im_files = [lb["im_file"] for lb in labels]  # update im_files
 
-        # Check if the dataset is all boxes or all segments
-        lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
-        len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
-        if len_segments and len_boxes != len_segments:
-            LOGGER.warning(
-                f"Box and segment counts should be equal, but got len(segments) = {len_segments}, "
-                f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
-                "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
-            )
-            for lb in labels:
-                lb["segments"] = []
-        if len_cls == 0:
-            LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
+        # Check if the dataset is all boxes or all segments (skip for depth task)
+        if not self.use_depth:
+            lengths = ((len(lb["cls"]), len(lb["bboxes"]), len(lb["segments"])) for lb in labels)
+            len_cls, len_boxes, len_segments = (sum(x) for x in zip(*lengths))
+            if len_segments and len_boxes != len_segments:
+                LOGGER.warning(
+                    f"Box and segment counts should be equal, but got len(segments) = {len_segments}, "
+                    f"len(boxes) = {len_boxes}. To resolve this only boxes will be used and all segments will be removed. "
+                    "To avoid this please supply either a detect or segment dataset, not a detect-segment mixed dataset."
+                )
+                for lb in labels:
+                    lb["segments"] = []
+            if len_cls == 0:
+                LOGGER.warning(f"Labels are missing or empty in {cache_path}, training may not work correctly. {HELP_URL}")
+        
         return labels
 
     def build_transforms(self, hyp: dict | None = None) -> Compose:
@@ -217,26 +266,101 @@ class YOLODataset(BaseDataset):
         Returns:
             (Compose): Composed transforms.
         """
-        if self.augment:
-            hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
-            hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
-            hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
-            transforms = v8_transforms(self, self.imgsz, hyp)
-        else:
-            transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
-        transforms.append(
-            Format(
-                bbox_format="xywh",
-                normalize=True,
-                return_mask=self.use_segments,
-                return_keypoint=self.use_keypoints,
-                return_obb=self.use_obb,
-                batch_idx=True,
-                mask_ratio=hyp.mask_ratio,
-                mask_overlap=hyp.overlap_mask,
-                bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+        if self.use_depth:
+            # For depth task, choose between DirectResize or LetterBox based on data config
+            # DirectResize: Standard for depth estimation, can use Depth Anything V2-style options
+            # LetterBox: YOLO style, preserve aspect ratio with padding
+            resize_mode = self.data.get("resize_mode", "resize")  # default to 'resize'
+            
+            if self.augment:
+                # Apply depth-specific augmentations
+                # Support for Depth Anything V2-style resize parameters
+                stretch = resize_mode == "stretch"  # Direct resize without any aspect ratio preservation
+                keep_aspect_ratio = self.data.get("keep_aspect_ratio", False)
+                ensure_multiple_of = self.data.get("ensure_multiple_of", 1)
+                resize_method = self.data.get("resize_method", "lower_bound")
+                image_interpolation = self.data.get("image_interpolation", cv2.INTER_LINEAR)
+                depth_interpolation = self.data.get("depth_interpolation", cv2.INTER_LINEAR)
+                
+                transforms = depth_transforms(
+                    self, 
+                    self.imgsz, 
+                    hyp,
+                    stretch=stretch,
+                    keep_aspect_ratio=keep_aspect_ratio,
+                    ensure_multiple_of=ensure_multiple_of,
+                    resize_method=resize_method,
+                    image_interpolation=image_interpolation,
+                    depth_interpolation=depth_interpolation,
+                )
+            elif resize_mode == "resize":
+                # Check if we should use advanced DirectResize options
+                keep_aspect_ratio = self.data.get("keep_aspect_ratio", False)
+                ensure_multiple_of = self.data.get("ensure_multiple_of", 1)
+                resize_method = self.data.get("resize_method", "lower_bound")
+                image_interpolation = self.data.get("image_interpolation", cv2.INTER_LINEAR)
+                depth_interpolation = self.data.get("depth_interpolation", cv2.INTER_LINEAR)
+                
+                transforms = Compose([
+                    DirectResize(
+                        size=(self.imgsz, self.imgsz),
+                        keep_aspect_ratio=keep_aspect_ratio,
+                        ensure_multiple_of=ensure_multiple_of,
+                        resize_method=resize_method,
+                        image_interpolation=image_interpolation,
+                        depth_interpolation=depth_interpolation,
+                    )
+                ])
+            elif resize_mode == "stretch":
+                # Stretch mode: direct resize without aspect ratio preservation
+                image_interpolation = self.data.get("image_interpolation", cv2.INTER_LINEAR)
+                depth_interpolation = self.data.get("depth_interpolation", cv2.INTER_LINEAR)
+                transforms = Compose([
+                    DirectResize(
+                        size=(self.imgsz, self.imgsz),
+                        keep_aspect_ratio=False,
+                        ensure_multiple_of=1,
+                        image_interpolation=image_interpolation,
+                        depth_interpolation=depth_interpolation,
+                    )
+                ])
+            else:
+                # LetterBox with padding (use padding_value=0 for depth to mark invalid regions)
+                transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False, padding_value=0)])
+            
+            transforms.append(
+                Format(
+                    bbox_format="xywh",
+                    normalize=False,
+                    return_mask=False,
+                    return_keypoint=False,
+                    return_obb=False,
+                    batch_idx=False,
+                    bgr=0.0,  # No BGR flip for depth task
+                )
             )
-        )
+        else:
+            # Original transforms for detection/segmentation/pose/obb tasks
+            if self.augment:
+                hyp.mosaic = hyp.mosaic if self.augment and not self.rect else 0.0
+                hyp.mixup = hyp.mixup if self.augment and not self.rect else 0.0
+                hyp.cutmix = hyp.cutmix if self.augment and not self.rect else 0.0
+                transforms = v8_transforms(self, self.imgsz, hyp)
+            else:
+                transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)])
+            transforms.append(
+                Format(
+                    bbox_format="xywh",
+                    normalize=True,
+                    return_mask=self.use_segments,
+                    return_keypoint=self.use_keypoints,
+                    return_obb=self.use_obb,
+                    batch_idx=True,
+                    mask_ratio=hyp.mask_ratio,
+                    mask_overlap=hyp.overlap_mask,
+                    bgr=hyp.bgr if self.augment else 0.0,  # only affect training.
+                )
+            )
         return transforms
 
     def close_mosaic(self, hyp: dict) -> None:
@@ -252,6 +376,94 @@ class YOLODataset(BaseDataset):
         hyp.cutmix = 0.0
         self.transforms = self.build_transforms(hyp)
 
+    def get_image_and_label(self, index: int) -> dict:
+        """
+        Get and return label information from the dataset.
+        For depth task, also load corresponding depth map.
+
+        Args:
+            index (int): Index of the image to retrieve.
+
+        Returns:
+            (dict): Label dictionary with image and metadata.
+        """
+        from copy import deepcopy
+        
+        label = deepcopy(self.labels[index])  # requires deepcopy()
+        label.pop("shape", None)  # shape is for rect, remove it
+        label["img"], label["ori_shape"], label["resized_shape"] = self.load_image(index)
+        label["ratio_pad"] = (
+            label["resized_shape"][0] / label["ori_shape"][0],
+            label["resized_shape"][1] / label["ori_shape"][1],
+        )
+        if self.rect:
+            label["rect_shape"] = self.batch_shapes[self.batch[index]]
+        
+        # Load depth map for depth task
+        if self.use_depth:
+            label["depth"] = self._load_depth_map(index, label["ori_shape"])
+        
+        return self.update_labels_info(label)
+
+    def _load_depth_map(self, index: int, ori_shape: tuple) -> np.ndarray:
+        """
+        Load depth map corresponding to the image.
+
+        Args:
+            index (int): Index of the sample.
+            ori_shape (tuple): Original image shape (height, width).
+
+        Returns:
+            (np.ndarray): Depth map resized to image size.
+        """
+        # Convert image path to depth path
+        im_file = self.im_files[index]
+        
+        # Try different depth file extensions and locations
+        depth_extensions = [".npy", ".png", ".jpg", ".jpeg", ".tif", ".tiff"]
+        
+        # First try to find depth file in common locations
+        depth_file = None
+        for loc_base in [Path(im_file).parent.parent / "depths", Path(im_file).parent]:
+            for ext in depth_extensions:
+                candidate = loc_base / (Path(im_file).stem + ext)
+                if candidate.exists():
+                    depth_file = candidate
+                    break
+            if depth_file is not None:
+                break
+        
+        try:
+            if depth_file is None:
+                raise FileNotFoundError(f"No depth file found for {im_file}")
+            
+            depth_str = str(depth_file)
+            
+            # Load depth based on file format
+            if depth_str.endswith(".npy"):
+                depth = np.load(depth_file).astype(np.float32)
+            else:
+                # Load as image (PNG, JPG, etc.)
+                depth = cv2.imread(depth_str, cv2.IMREAD_UNCHANGED).astype(np.float32)
+                # If it's a 3-channel image, convert to grayscale
+                if depth.ndim == 3:
+                    if depth.shape[2] == 3:
+                        depth = cv2.cvtColor(depth.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
+                    elif depth.shape[2] == 1:
+                        depth = depth[:, :, 0]
+            
+            # Ensure it's 2D
+            if depth.ndim == 3 and depth.shape[2] == 1:
+                depth = depth[:, :, 0]
+            
+            # Resize to match image size
+            depth = cv2.resize(depth, (ori_shape[1], ori_shape[0]), interpolation=cv2.INTER_LINEAR)
+        except Exception as e:
+            LOGGER.warning(f"Failed to load depth map for {im_file}: {e}. Using zeros.")
+            depth = np.zeros(ori_shape, dtype=np.float32)
+        
+        return depth
+
     def update_labels_info(self, label: dict) -> dict:
         """
         Update label format for different tasks.
@@ -266,6 +478,10 @@ class YOLODataset(BaseDataset):
             cls is not with bboxes now, classification and semantic segmentation need an independent cls label
             Can also support classification and semantic segmentation by adding or removing dict keys there.
         """
+        # For depth task, skip instance creation
+        if self.use_depth:
+            return label
+        
         bboxes = label.pop("bboxes")
         segments = label.pop("segments", [])
         keypoints = label.pop("keypoints", None)
@@ -306,13 +522,34 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             elif k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
-                value = torch.cat(value, 0)
+            elif k == "depth":  # Handle depth maps for depth task
+                # Convert all depth values to tensors if needed and ensure correct shape
+                depth_list = []
+                for v in value:
+                    if isinstance(v, np.ndarray):
+                        v = torch.from_numpy(v).float()
+                    if isinstance(v, torch.Tensor):
+                        # Ensure depth is 3D (C, H, W)
+                        if v.ndim == 2:
+                            v = v.unsqueeze(0)
+                    depth_list.append(v)
+                # All depths should have the same shape after LetterBox, so stack directly
+                value = torch.stack(depth_list, 0)
+            elif k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+                # Only concatenate if all values are tensors (skip for depth task where these fields don't exist)
+                if all(isinstance(v, torch.Tensor) for v in value):
+                    value = torch.cat(value, 0)
+                else:
+                    # For depth task, skip these fields entirely
+                    continue
             new_batch[k] = value
-        new_batch["batch_idx"] = list(new_batch["batch_idx"])
-        for i in range(len(new_batch["batch_idx"])):
-            new_batch["batch_idx"][i] += i  # add target image index for build_targets()
-        new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        
+        # Handle batch_idx for non-depth tasks
+        if "batch_idx" in new_batch:
+            new_batch["batch_idx"] = list(new_batch["batch_idx"])
+            for i in range(len(new_batch["batch_idx"])):
+                new_batch["batch_idx"][i] += i  # add target image index for build_targets()
+            new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
         return new_batch
 
 

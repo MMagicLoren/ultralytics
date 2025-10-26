@@ -538,6 +538,101 @@ class Annotator:
         else:
             im.show(title=title)
 
+    def depth(self, depth_map: torch.Tensor | np.ndarray, colormap: int = cv2.COLORMAP_TURBO, alpha: float = 0.5, normalize: bool = False):
+        """
+        Overlay a depth map on the image with a color map.
+
+        Args:
+            depth_map (torch.Tensor | np.ndarray): Depth map with shape (H, W) or (1, H, W).
+                Expected to be in original depth range (e.g., [0, 255]) for correct visualization.
+            colormap (int, optional): OpenCV colormap to use. Default is cv2.COLORMAP_TURBO.
+            alpha (float, optional): Depth map transparency: 0.0 fully transparent, 1.0 opaque. Default is 0.5.
+            normalize (bool, optional): Whether to normalize depth map to [0, 255] range. Default is False.
+                Set to True only if depth_map is in normalized [0, 1] range.
+
+        Note:
+            - Modifies self.im in-place by overlaying the depth visualization.
+            - If depth_map has 3 dimensions, the first dimension must be 1.
+            - For consistent visualization, depth_map should be in original range (e.g., [0, 255]).
+        """
+        import torch as torch_module
+
+        # Convert depth to numpy if needed
+        if isinstance(depth_map, torch_module.Tensor):
+            depth_map = depth_map.cpu().numpy()
+
+        # Handle shape (1, H, W) -> (H, W)
+        if depth_map.ndim == 3 and depth_map.shape[0] == 1:
+            depth_map = depth_map.squeeze(0)
+
+        # Ensure 2D shape
+        if depth_map.ndim != 2:
+            raise ValueError(f"Depth map must be 2D or (1, H, W), got shape {depth_map.shape}")
+
+        # Normalize to [0, 255] if needed
+        # Only normalize valid regions (depth > 0) to avoid padding affecting the scale
+        valid_mask = depth_map > 0  # Always create valid_mask for filtering padding
+        
+        if normalize:
+            if valid_mask.any():
+                depth_min = depth_map[valid_mask].min()
+                depth_max = depth_map[valid_mask].max()
+                
+                # Create normalized depth map
+                depth_normalized = np.zeros_like(depth_map, dtype=np.uint8)
+                if depth_max > depth_min:
+                    # Normalize only valid regions
+                    depth_normalized[valid_mask] = ((depth_map[valid_mask] - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+                else:
+                    # If all valid values are the same, set to middle value
+                    depth_normalized[valid_mask] = 127
+            else:
+                # If no valid depth values, return all zeros
+                depth_normalized = np.zeros_like(depth_map, dtype=np.uint8)
+        else:
+            # When normalize=False, assume depth_map is already in [0, 255] range (from postprocess)
+            # Just clip to valid range and convert to uint8
+            depth_normalized = np.clip(depth_map, 0, 255).astype(np.uint8)
+
+        # Apply colormap
+        depth_colored = cv2.applyColorMap(depth_normalized, colormap)
+
+        # Get current image as numpy array
+        if isinstance(self.im, Image.Image):
+            im_array = np.asarray(self.im)
+        else:
+            im_array = self.im
+
+        # Ensure both images have same size
+        h, w = im_array.shape[:2]
+        depth_h, depth_w = depth_colored.shape[:2]
+
+        if (h, w) != (depth_h, depth_w):
+            depth_colored = cv2.resize(depth_colored, (w, h), interpolation=cv2.INTER_LINEAR)
+            # Also resize the valid mask
+            if normalize and valid_mask.any():
+                valid_mask_resized = cv2.resize(valid_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+            else:
+                valid_mask_resized = np.zeros((h, w), dtype=bool)
+        else:
+            valid_mask_resized = valid_mask if normalize else np.ones((h, w), dtype=bool)
+
+        # Blend images using cv2.addWeighted, only on valid regions
+        # alpha controls depth map opacity: 0.0 = transparent, 1.0 = opaque
+        if valid_mask_resized.any():
+            # Only blend where depth is valid (non-padding)
+            im_array[valid_mask_resized] = cv2.addWeighted(
+                im_array[valid_mask_resized], 1 - alpha, 
+                depth_colored[valid_mask_resized], alpha, 0
+            )
+        # Padding regions (valid_mask_resized == False) keep original image
+
+        # Update self.im
+        if self.pil:
+            self.fromarray(im_array)
+        else:
+            self.im = im_array
+
     def save(self, filename: str = "image.jpg"):
         """Save the annotated image to 'filename'."""
         cv2.imwrite(filename, np.asarray(self.im))
@@ -698,9 +793,11 @@ def plot_images(
     max_subplots: int = 16,
     save: bool = True,
     conf_thres: float = 0.25,
+    depths: torch.Tensor | np.ndarray | None = None,
+    depth_range: tuple[float, float] | None = None,
 ) -> np.ndarray | None:
     """
-    Plot image grid with labels, bounding boxes, masks, and keypoints.
+    Plot image grid with labels, bounding boxes, masks, keypoints, and depth maps.
 
     Args:
         labels (dict[str, Any]): Dictionary containing detection data with keys like 'cls', 'bboxes', 'conf', 'masks', 'keypoints', 'batch_idx', 'img'.
@@ -713,6 +810,8 @@ def plot_images(
         max_subplots (int): Maximum number of subplots in the image grid.
         save (bool): Whether to save the plotted image grid to a file.
         conf_thres (float): Confidence threshold for displaying detections.
+        depths (Optional[torch.Tensor | np.ndarray]): Depth maps for depth estimation task. Shape: (batch_size, 1, height, width).
+        depth_range (Optional[tuple[float, float]]): Fixed depth range (min, max) for normalization. If None, use auto range per image.
 
     Returns:
         (np.ndarray): Plotted image grid as a numpy array if save is False, None otherwise.
@@ -726,8 +825,13 @@ def plot_images(
         - 2 channels: Third channel added as zeros
         - 3 channels: Used as-is (standard RGB)
         - 4+ channels: Cropped to first 3 channels
+        
+        Depth Support:
+        - For depth estimation tasks, pass depth maps via 'depths' parameter
+        - Depth maps are visualized using a colormap (turbo)
+        - Use depth_range to specify fixed normalization range for consistent visualization
     """
-    for k in {"cls", "bboxes", "conf", "masks", "keypoints", "batch_idx", "images"}:
+    for k in {"cls", "bboxes", "conf", "masks", "keypoints", "batch_idx", "images", "depths"}:
         if k not in labels:
             continue
         if k == "cls" and labels[k].ndim == 2:
@@ -741,10 +845,19 @@ def plot_images(
     confs = labels.get("conf", None)
     masks = labels.get("masks", np.zeros(0, dtype=np.uint8))
     kpts = labels.get("keypoints", np.zeros(0, dtype=np.float32))
+    depths = labels.get("depths", depths)  # get depths from labels or parameter
     images = labels.get("img", images)  # default to input images
 
     if len(images) and isinstance(images, torch.Tensor):
         images = images.cpu().float().numpy()
+    
+    # Handle depths tensor
+    if depths is not None:
+        if isinstance(depths, torch.Tensor):
+            depths = depths.cpu().float().numpy()
+        # Ensure depths have correct shape (B, H, W) or (B, 1, H, W)
+        if depths.ndim == 4 and depths.shape[1] == 1:
+            depths = depths.squeeze(1)  # Remove channel dimension if present
 
     # Handle 2-ch and n-ch images
     c = images.shape[1]
@@ -765,6 +878,96 @@ def plot_images(
     for i in range(bs):
         x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
         mosaic[y : y + h, x : x + w, :] = images[i].transpose(1, 2, 0)
+    
+    # For depth task, overlay depth heatmap on images (similar to mask visualization)
+    if depths is not None and len(depths) > 0:
+        # Import matplotlib colormap for depth visualization
+        import matplotlib.cm as cm  # colormap module
+        
+        depth_colormap = cm.get_cmap("turbo")
+        
+        for i in range(bs):
+            x_start = int(w * (i // ns))
+            y_start = int(h * (i % ns))
+            
+            # Ensure we have a depth map for this image
+            if i >= len(depths):
+                continue
+                
+            depth = depths[i]  # (H, W) or (1, H, W)
+            
+            # Handle different depth shapes
+            if depth.ndim == 3 and depth.shape[0] == 1:
+                depth = depth[0]  # Remove channel dimension
+            elif depth.ndim != 2:
+                continue  # Skip if depth shape is unexpected
+            
+            # Convert to float32 to prevent overflow
+            depth = depth.astype(np.float32)
+            
+            # Skip if depth is all zeros (invalid/missing depth)
+            if np.sum(np.abs(depth)) < 1e-6:
+                continue
+            
+            # Create valid mask BEFORE resize
+            # For GT: padding regions are exactly 0 (set by LetterBox)
+            # For predictions: padding is masked to 0 in plot_predictions
+            # Use small threshold to account for numerical precision
+            valid_mask_orig = depth > 0.5
+            
+            # Set invalid regions to 0 to avoid interpolation artifacts
+            depth_masked = depth.copy()
+            depth_masked[~valid_mask_orig] = 0.0
+            
+            # Resize depth to match image dimensions if needed
+            if depth_masked.shape != (h, w):
+                depth = cv2.resize(depth_masked, (w, h), interpolation=cv2.INTER_LINEAR)
+                # Resize mask using NEAREST to keep sharp boundaries
+                valid_mask = cv2.resize(valid_mask_orig.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+            else:
+                depth = depth_masked
+                valid_mask = valid_mask_orig
+            
+            if not np.any(valid_mask):
+                continue  # Skip if all depth values are zero/invalid (all padding)
+            
+            # Use fixed depth range if provided, otherwise use per-image min/max
+            if depth_range is not None:
+                depth_min, depth_max = depth_range
+                depth_min = float(depth_min)
+                depth_max = float(depth_max)
+            else:
+                # Auto range: use valid depths' min/max
+                valid_depths = depth[valid_mask].astype(np.float32)
+                depth_min = float(np.min(valid_depths))
+                depth_max = float(np.max(valid_depths))
+            
+            # Handle edge cases for normalization
+            if depth_max <= depth_min or (depth_max - depth_min) < 1e-6:
+                # All valid values are the same
+                depth_norm = np.where(valid_mask, 0.5, 0.0).astype(np.float32)
+            else:
+                # Normal case: normalize depths to [0, 1] using the specified range
+                depth_norm = np.zeros_like(depth, dtype=np.float32)
+                # Clip depth to valid range before normalization
+                depth_clipped = np.clip(depth, depth_min, depth_max)
+                depth_norm[valid_mask] = (depth_clipped[valid_mask] - depth_min) / (depth_max - depth_min)
+            
+            # Clip to [0, 1] to be safe
+            depth_norm = np.clip(depth_norm, 0.0, 1.0)
+            
+            # Apply colormap and convert to RGB
+            depth_colored = depth_colormap(depth_norm)[:, :, :3]  # Get RGB, drop alpha
+            depth_colored = (depth_colored * 255).astype(np.uint8)
+            
+            # Create alpha mask for blending (only blend where depth is valid)
+            alpha = np.where(valid_mask, 0.7, 0.0).astype(np.float32)[:, :, None]
+            
+            # Blend depth heatmap with image (70% depth on valid regions, original image on invalid)
+            mosaic_region = mosaic[y_start : y_start + h, x_start : x_start + w, :].astype(np.float32)
+            depth_region = depth_colored.astype(np.float32)
+            blended = mosaic_region * (1 - alpha) + depth_region * alpha
+            mosaic[y_start : y_start + h, x_start : x_start + w, :] = blended.astype(np.uint8)
 
     # Resize (optional)
     scale = max_size / ns / max(h, w)
@@ -773,47 +976,48 @@ def plot_images(
         w = math.ceil(scale * w)
         mosaic = cv2.resize(mosaic, tuple(int(x * ns) for x in (w, h)))
 
-    # Annotate
-    fs = int((h + w) * ns * 0.01)  # font size
-    fs = max(fs, 18)  # ensure that the font size is large enough to be easily readable.
-    annotator = Annotator(mosaic, line_width=round(fs / 10), font_size=fs, pil=True, example=str(names))
-    for i in range(bs):
-        x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
-        annotator.rectangle([x, y, x + w, y + h], None, (255, 255, 255), width=2)  # borders
-        if paths:
-            annotator.text([x + 5, y + 5], text=Path(paths[i]).name[:40], txt_color=(220, 220, 220))  # filenames
-        if len(cls) > 0:
-            idx = batch_idx == i
-            classes = cls[idx].astype("int")
-            labels = confs is None
-            conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
+    # Annotate (skip for depth-only visualization)
+    if depths is None or len(depths) == 0:
+        fs = int((h + w) * ns * 0.01)  # font size
+        fs = max(fs, 18)  # ensure that the font size is large enough to be easily readable.
+        annotator = Annotator(mosaic, line_width=round(fs / 10), font_size=fs, pil=True, example=str(names))
+        for i in range(bs):
+            x, y = int(w * (i // ns)), int(h * (i % ns))  # block origin
+            annotator.rectangle([x, y, x + w, y + h], None, (255, 255, 255), width=2)  # borders
+            if paths:
+                annotator.text([x + 5, y + 5], text=Path(paths[i]).name[:40], txt_color=(220, 220, 220))  # filenames
+            if len(cls) > 0:
+                idx = batch_idx == i
+                classes = cls[idx].astype("int")
+                labels = confs is None
+                conf = confs[idx] if confs is not None else None  # check for confidence presence (label vs pred)
 
-            if len(bboxes):
-                boxes = bboxes[idx]
-                if len(boxes):
-                    if boxes[:, :4].max() <= 1.1:  # if normalized with tolerance 0.1
-                        boxes[..., [0, 2]] *= w  # scale to pixels
-                        boxes[..., [1, 3]] *= h
-                    elif scale < 1:  # absolute coords need scale if image scales
-                        boxes[..., :4] *= scale
-                boxes[..., 0] += x
-                boxes[..., 1] += y
-                is_obb = boxes.shape[-1] == 5  # xywhr
-                # TODO: this transformation might be unnecessary
-                boxes = ops.xywhr2xyxyxyxy(boxes) if is_obb else ops.xywh2xyxy(boxes)
-                for j, box in enumerate(boxes.astype(np.int64).tolist()):
-                    c = classes[j]
-                    color = colors(c)
-                    c = names.get(c, c) if names else c
-                    if labels or conf[j] > conf_thres:
-                        label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
-                        annotator.box_label(box, label, color=color)
+                if len(bboxes):
+                    boxes = bboxes[idx]
+                    if len(boxes):
+                        if boxes[:, :4].max() <= 1.1:  # if normalized with tolerance 0.1
+                            boxes[..., [0, 2]] *= w  # scale to pixels
+                            boxes[..., [1, 3]] *= h
+                        elif scale < 1:  # absolute coords need scale if image scales
+                            boxes[..., :4] *= scale
+                    boxes[..., 0] += x
+                    boxes[..., 1] += y
+                    is_obb = boxes.shape[-1] == 5  # xywhr
+                    # TODO: this transformation might be unnecessary
+                    boxes = ops.xywhr2xyxyxyxy(boxes) if is_obb else ops.xywh2xyxy(boxes)
+                    for j, box in enumerate(boxes.astype(np.int64).tolist()):
+                        c = classes[j]
+                        color = colors(c)
+                        c = names.get(c, c) if names else c
+                        if labels or conf[j] > conf_thres:
+                            label = f"{c}" if labels else f"{c} {conf[j]:.1f}"
+                            annotator.box_label(box, label, color=color)
 
-            elif len(classes):
-                for c in classes:
-                    color = colors(c)
-                    c = names.get(c, c) if names else c
-                    label = f"{c}" if labels else f"{c} {conf[0]:.1f}"
+                elif len(classes):
+                    for c in classes:
+                        color = colors(c)
+                        c = names.get(c, c) if names else c
+                        label = f"{c}" if labels else f"{c} {conf[0]:.1f}"
                     annotator.text([x, y], label, txt_color=color, box_color=(64, 64, 64, 128))
 
             # Plot keypoints
@@ -859,11 +1063,23 @@ def plot_images(
                         except Exception:
                             pass
                 annotator.fromarray(im)
-    if not save:
-        return np.asarray(annotator.im)
-    annotator.im.save(fname)  # save
-    if on_plot:
-        on_plot(fname)
+    
+    # Handle saving for both depth and non-depth tasks
+    if depths is not None and len(depths) > 0:
+        # For depth visualization, save directly from mosaic
+        if save:
+            Image.fromarray(mosaic).save(fname, quality=95, subsampling=0)
+            if on_plot:
+                on_plot(fname)
+        else:
+            return mosaic
+    else:
+        # For detection/segmentation/pose tasks, use annotator
+        if not save:
+            return np.asarray(annotator.im)
+        annotator.im.save(fname)  # save
+        if on_plot:
+            on_plot(fname)
 
 
 @plt_settings()
@@ -883,42 +1099,68 @@ def plot_results(file: str = "path/to/results.csv", dir: str = "", on_plot: Call
     """
     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
     import polars as pl
-    from scipy.ndimage import gaussian_filter1d
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        from scipy.ndimage import gaussian_filter1d
 
     save_dir = Path(file).parent if file else Path(dir)
     files = list(save_dir.glob("results*.csv"))
     assert len(files), f"No results.csv files found in {save_dir.resolve()}, nothing to plot."
 
     loss_keys, metric_keys = [], []
+    fig = None
+    ax = None
     for i, f in enumerate(files):
         try:
             data = pl.read_csv(f, infer_schema_length=None)
             if i == 0:
                 for c in data.columns:
-                    if "loss" in c:
+                    # Skip non-metric columns
+                    if c.lower() in ["epoch", "time"] or c.startswith("lr/"):
+                        continue
+                    # Match loss columns (train/loss, val/l1_loss, etc.) or metric columns
+                    if "/loss" in c or "loss" in c.lower():
                         loss_keys.append(c)
-                    elif "metric" in c:
+                    # Match depth metrics: mae, rmse, abs_rel, delta1/2/3, or general metrics
+                    # Exclude sq_rel as it's not commonly used
+                    elif any(m in c.lower() for m in ["mae", "rmse", "abs_rel", "absrel", "delta", "metric"]) and "sq_rel" not in c.lower():
                         metric_keys.append(c)
+                if not loss_keys and not metric_keys:
+                    # No matching columns found, skip plotting
+                    LOGGER.warning(f"No loss or metric columns found in {f}")
+                    continue
                 loss_mid, metric_mid = len(loss_keys) // 2, len(metric_keys) // 2
                 columns = (
                     loss_keys[:loss_mid] + metric_keys[:metric_mid] + loss_keys[loss_mid:] + metric_keys[metric_mid:]
                 )
-                fig, ax = plt.subplots(2, len(columns) // 2, figsize=(len(columns) + 2, 6), tight_layout=True)
-                ax = ax.ravel()
+                if len(columns) > 0:
+                    fig, ax = plt.subplots(2, max(1, len(columns) // 2), figsize=(len(columns) + 2, 6), tight_layout=True)
+                    ax = ax.ravel() if ax.ndim > 0 else [ax]  # Handle single subplot case
+            if ax is None:
+                continue
             x = data.select(data.columns[0]).to_numpy().flatten()
             for i, j in enumerate(columns):
                 y = data.select(j).to_numpy().flatten().astype("float")
                 ax[i].plot(x, y, marker=".", label=f.stem, linewidth=2, markersize=8)  # actual results
                 ax[i].plot(x, gaussian_filter1d(y, sigma=3), ":", label="smooth", linewidth=2)  # smoothing line
                 ax[i].set_title(j, fontsize=12)
+                ax[i].set_xlabel("epoch")
+                ax[i].set_ylabel(j)
         except Exception as e:
             LOGGER.error(f"Plotting error for {f}: {e}")
-    ax[1].legend()
-    fname = save_dir / "results.png"
-    fig.savefig(fname, dpi=200)
-    plt.close()
-    if on_plot:
-        on_plot(fname)
+    
+    if fig is not None and ax is not None:
+        # Add legend to all subplots
+        for a in ax:
+            try:
+                a.legend()
+            except:
+                pass
+        fname = save_dir / "results.png"
+        fig.savefig(fname, dpi=200)
+        plt.close()
+        if on_plot:
+            on_plot(fname)
 
 
 def plt_color_scatter(v, f, bins: int = 20, cmap: str = "viridis", alpha: float = 0.8, edgecolors: str = "none"):
@@ -969,7 +1211,9 @@ def plot_tune_results(csv_file: str = "tune_results.csv", exclude_zero_fitness_p
     """
     import matplotlib.pyplot as plt  # scope for faster 'import ultralytics'
     import polars as pl
-    from scipy.ndimage import gaussian_filter1d
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning)
+        from scipy.ndimage import gaussian_filter1d
 
     def _save_one_file(file):
         """Save one matplotlib plot to 'file'."""
