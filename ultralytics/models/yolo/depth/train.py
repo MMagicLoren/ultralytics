@@ -114,10 +114,12 @@ class DepthTrainer(BaseTrainer):
     
     def preprocess_batch(self, batch):
         """
-        Preprocess batch by normalizing images and moving data to device.
+        Preprocess batch by moving data to device and applying dtype conversion.
+        
+        Note: Depth normalization is already done in Format class (Per-image normalization to [0,1]).
         
         Args:
-            batch (dict): Batch data containing images and depth maps.
+            batch (dict): Batch data containing images and depth maps (already normalized to [0,1]).
         
         Returns:
             (dict): Preprocessed batch data.
@@ -129,15 +131,8 @@ class DepthTrainer(BaseTrainer):
         batch["img"] = batch["img"].to(self.device).to(dtype) / 255.0  # normalize images to [0, 1]
         
         if "depth" in batch:
+            # Depth is already normalized to [0, 1] by Format class (Per-image normalization)
             batch["depth"] = batch["depth"].to(self.device).float()  # Keep depth as float32 for loss computation
-            
-            # Normalize depth maps to [0, 1] range based on dataset config
-            depth_min = self.data.get("depth_min", 0.0)
-            depth_max = self.data.get("depth_max", 1.0)
-            
-            if depth_max > depth_min:
-                batch["depth"] = (batch["depth"] - depth_min) / (depth_max - depth_min)
-                batch["depth"] = torch.clamp(batch["depth"], 0.0, 1.0)
         
         return batch
 

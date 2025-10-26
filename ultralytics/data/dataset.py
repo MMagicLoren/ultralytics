@@ -331,7 +331,7 @@ class YOLODataset(BaseDataset):
             transforms.append(
                 Format(
                     bbox_format="xywh",
-                    normalize=False,
+                    normalize=True,  # ✅ Enable Per-image depth normalization to [0,1]
                     return_mask=False,
                     return_keypoint=False,
                     return_obb=False,

@@ -2728,6 +2728,23 @@ class Format:
                 elif depth.ndim == 2:
                     # Shape is (H, W), add channel dimension
                     depth = np.expand_dims(depth, axis=2)
+                
+                # Per-image normalization for relative depth estimation
+                # Each image's depth is normalized independently to [0, 1]
+                depth_2d = depth.squeeze()  # (H, W)
+                depth_min = float(depth_2d.min())
+                depth_max = float(depth_2d.max())
+                
+                # Store min/max for denormalization during inference/visualization
+                labels["depth_min"] = depth_min
+                labels["depth_max"] = depth_max
+                
+                # Normalize to [0, 1]
+                if depth_max > depth_min:
+                    depth = (depth - depth_min) / (depth_max - depth_min)
+                else:
+                    depth = np.zeros_like(depth)
+                
                 # Convert (H, W, C) to (C, H, W) and then to tensor
                 depth = np.transpose(depth, (2, 0, 1))  # (H, W, C) -> (C, H, W)
                 labels["depth"] = torch.from_numpy(depth.astype(np.float32))
