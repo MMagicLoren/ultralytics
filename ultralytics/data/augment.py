@@ -24,6 +24,10 @@ from ultralytics.utils.torch_utils import TORCHVISION_0_10, TORCHVISION_0_11, TO
 DEFAULT_MEAN = (0.0, 0.0, 0.0)
 DEFAULT_STD = (1.0, 1.0, 1.0)
 
+# ImageNet normalization parameters (commonly used in depth estimation models like Depth Anything)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
 
 class BaseTransform:
     """
@@ -624,11 +628,28 @@ class Mosaic(BaseMixTransform):
         """
         mosaic_labels = []
         s = self.imgsz
+        
+        # Check if depth data exists in the first label (all should have it or none)
+        has_depth = "depth" in labels and labels["depth"] is not None
+        if has_depth:
+            # Initialize depth mosaic (float32 for depth values)
+            depth3 = np.zeros((s * 3, s * 3), dtype=np.float32)
+        
         for i in range(3):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
+            
+            # Load depth if available
+            depth = labels_patch.get("depth", None) if has_depth else None
+            if depth is not None:
+                # Ensure depth is 2D (H, W)
+                if depth.ndim == 3:
+                    depth = depth.squeeze(0)
+                # Ensure depth shape matches image dimensions
+                if depth.shape != (h, w):
+                    depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
             # Place img in img3
             if i == 0:  # center
@@ -643,7 +664,17 @@ class Mosaic(BaseMixTransform):
             padw, padh = c[:2]
             x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coordinates
 
-            img3[y1:y2, x1:x2] = img[y1 - padh :, x1 - padw :]  # img3[ymin:ymax, xmin:xmax]
+            # Calculate source image region
+            src_y1 = y1 - padh
+            src_x1 = x1 - padw
+            src_y2 = src_y1 + (y2 - y1)
+            src_x2 = src_x1 + (x2 - x1)
+            
+            img3[y1:y2, x1:x2] = img[src_y1:src_y2, src_x1:src_x2]  # img3[ymin:ymax, xmin:xmax]
+            
+            # Process depth in the same way - use same source region
+            if has_depth and depth is not None:
+                depth3[y1:y2, x1:x2] = depth[src_y1:src_y2, src_x1:src_x2]
             # hp, wp = h, w  # height, width previous for next iteration
 
             # Labels assuming imgsz*2 mosaic size
@@ -652,6 +683,11 @@ class Mosaic(BaseMixTransform):
         final_labels = self._cat_labels(mosaic_labels)
 
         final_labels["img"] = img3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        
+        # Add depth to final labels if present
+        if has_depth:
+            final_labels["depth"] = depth3[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        
         return final_labels
 
     def _mosaic4(self, labels: dict[str, Any]) -> dict[str, Any]:
@@ -681,11 +717,28 @@ class Mosaic(BaseMixTransform):
         mosaic_labels = []
         s = self.imgsz
         yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.border)  # mosaic center x, y
+        
+        # Check if depth data exists in the first label (all should have it or none)
+        has_depth = "depth" in labels and labels["depth"] is not None
+        if has_depth:
+            # Initialize depth mosaic (float32 for depth values)
+            depth4 = np.zeros((s * 2, s * 2), dtype=np.float32)
+        
         for i in range(4):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
+            
+            # Load depth if available
+            depth = labels_patch.get("depth", None) if has_depth else None
+            if depth is not None:
+                # Ensure depth is 2D (H, W)
+                if depth.ndim == 3:
+                    depth = depth.squeeze(0)
+                # Ensure depth shape matches image dimensions
+                if depth.shape != (h, w):
+                    depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
             # Place img in img4
             if i == 0:  # top left
@@ -703,6 +756,11 @@ class Mosaic(BaseMixTransform):
                 x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
             img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+            
+            # Process depth in the same way
+            if has_depth and depth is not None:
+                depth4[y1a:y2a, x1a:x2a] = depth[y1b:y2b, x1b:x2b]
+            
             padw = x1a - x1b
             padh = y1a - y1b
 
@@ -710,6 +768,11 @@ class Mosaic(BaseMixTransform):
             mosaic_labels.append(labels_patch)
         final_labels = self._cat_labels(mosaic_labels)
         final_labels["img"] = img4
+        
+        # Add depth to final labels if present
+        if has_depth:
+            final_labels["depth"] = depth4
+        
         return final_labels
 
     def _mosaic9(self, labels: dict[str, Any]) -> dict[str, Any]:
@@ -741,11 +804,28 @@ class Mosaic(BaseMixTransform):
         mosaic_labels = []
         s = self.imgsz
         hp, wp = -1, -1  # height, width previous
+        
+        # Check if depth data exists in the first label (all should have it or none)
+        has_depth = "depth" in labels and labels["depth"] is not None
+        if has_depth:
+            # Initialize depth mosaic (float32 for depth values)
+            depth9 = np.zeros((s * 3, s * 3), dtype=np.float32)
+        
         for i in range(9):
             labels_patch = labels if i == 0 else labels["mix_labels"][i - 1]
             # Load image
             img = labels_patch["img"]
             h, w = labels_patch.pop("resized_shape")
+            
+            # Load depth if available
+            depth = labels_patch.get("depth", None) if has_depth else None
+            if depth is not None:
+                # Ensure depth is 2D (H, W)
+                if depth.ndim == 3:
+                    depth = depth.squeeze(0)
+                # Ensure depth shape matches image dimensions
+                if depth.shape != (h, w):
+                    depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
             # Place img in img9
             if i == 0:  # center
@@ -772,8 +852,19 @@ class Mosaic(BaseMixTransform):
             padw, padh = c[:2]
             x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coordinates
 
+            # Calculate source image region
+            src_y1 = y1 - padh
+            src_x1 = x1 - padw
+            src_y2 = src_y1 + (y2 - y1)
+            src_x2 = src_x1 + (x2 - x1)
+            
             # Image
-            img9[y1:y2, x1:x2] = img[y1 - padh :, x1 - padw :]  # img9[ymin:ymax, xmin:xmax]
+            img9[y1:y2, x1:x2] = img[src_y1:src_y2, src_x1:src_x2]  # img9[ymin:ymax, xmin:xmax]
+            
+            # Process depth in the same way - use same source region
+            if has_depth and depth is not None:
+                depth9[y1:y2, x1:x2] = depth[src_y1:src_y2, src_x1:src_x2]
+            
             hp, wp = h, w  # height, width previous for next iteration
 
             # Labels assuming imgsz*2 mosaic size
@@ -782,6 +873,11 @@ class Mosaic(BaseMixTransform):
         final_labels = self._cat_labels(mosaic_labels)
 
         final_labels["img"] = img9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        
+        # Add depth to final labels if present
+        if has_depth:
+            final_labels["depth"] = depth9[-self.border[0] : self.border[0], -self.border[1] : self.border[1]]
+        
         return final_labels
 
     @staticmethod
@@ -924,8 +1020,17 @@ class MixUp(BaseMixTransform):
         r = np.random.beta(32.0, 32.0)  # mixup ratio, alpha=beta=32.0
         labels2 = labels["mix_labels"][0]
         labels["img"] = (labels["img"] * r + labels2["img"] * (1 - r)).astype(np.uint8)
-        labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
-        labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        
+        # Handle depth maps for depth task
+        if "depth" in labels and "depth" in labels2:
+            labels["depth"] = labels["depth"] * r + labels2["depth"] * (1 - r)
+        elif "depth" not in labels and "depth" in labels2:
+            labels["depth"] = labels2["depth"] * (1 - r)
+        
+        # Only mix instances/cls for non-depth tasks
+        if "instances" in labels:
+            labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
+            labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
         return labels
 
 
@@ -1036,6 +1141,10 @@ class CutMix(BaseMixTransform):
         # Apply CutMix
         x1, y1, x2, y2 = area.astype(np.int32)
         labels["img"][y1:y2, x1:x2] = labels2["img"][y1:y2, x1:x2]
+        
+        # Apply CutMix to depth map if present
+        if "depth" in labels and "depth" in labels2:
+            labels["depth"][y1:y2, x1:x2] = labels2["depth"][y1:y2, x1:x2]
 
         # Restrain instances2 to the random bounding border
         instances2.add_padding(-x1, -y1)
@@ -1119,7 +1228,7 @@ class RandomPerspective:
         self.border = border  # mosaic border
         self.pre_transform = pre_transform
 
-    def affine_transform(self, img: np.ndarray, border: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, float]:
+    def affine_transform(self, img: np.ndarray, border: tuple[int, int], depth: np.ndarray = None) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
         """
         Apply a sequence of affine transformations centered around the image center.
 
@@ -1130,17 +1239,19 @@ class RandomPerspective:
         Args:
             img (np.ndarray): Input image to be transformed.
             border (tuple[int, int]): Border dimensions for the transformed image.
+            depth (np.ndarray): Optional depth map to be transformed with the same matrix.
 
         Returns:
             img (np.ndarray): Transformed image.
             M (np.ndarray): 3x3 transformation matrix.
             s (float): Scale factor applied during the transformation.
+            depth (np.ndarray): Transformed depth map (or None if not provided).
 
         Examples:
             >>> import numpy as np
             >>> img = np.random.rand(100, 100, 3)
             >>> border = (10, 10)
-            >>> transformed_img, matrix, scale = affine_transform(img, border)
+            >>> transformed_img, matrix, scale, _ = affine_transform(img, border)
         """
         # Center
         C = np.eye(3, dtype=np.float32)
@@ -1181,7 +1292,20 @@ class RandomPerspective:
                 img = cv2.warpAffine(img, M[:2], dsize=self.size, borderValue=(114, 114, 114))
             if img.ndim == 2:
                 img = img[..., None]
-        return img, M, s
+            
+            # Apply same transformation to depth map if provided
+            if depth is not None:
+                # Ensure depth is 2D
+                if depth.ndim == 3:
+                    depth = depth.squeeze()
+                if self.perspective:
+                    depth = cv2.warpPerspective(depth, M, dsize=self.size, borderValue=0)
+                else:  # affine
+                    depth = cv2.warpAffine(depth, M[:2], dsize=self.size, borderValue=0)
+                if depth.ndim == 2:
+                    depth = depth[..., None]
+        
+        return img, M, s, depth
 
     def apply_bboxes(self, bboxes: np.ndarray, M: np.ndarray) -> np.ndarray:
         """
@@ -1303,6 +1427,7 @@ class RandomPerspective:
                     'instances' (Instances): Object instances with bounding boxes, segments, and keypoints.
                 May include:
                     'mosaic_border' (tuple[int, int]): Border size for mosaic augmentation.
+                    'depth' (np.ndarray): Optional depth map for depth estimation tasks.
 
         Returns:
             (dict[str, Any]): Transformed labels dictionary containing:
@@ -1310,6 +1435,7 @@ class RandomPerspective:
                 - 'cls' (np.ndarray): Updated class labels.
                 - 'instances' (Instances): Updated object instances.
                 - 'resized_shape' (tuple[int, int]): New image shape after transformation.
+                - 'depth' (np.ndarray): Transformed depth map (if present in input).
 
         Examples:
             >>> transform = RandomPerspective()
@@ -1335,9 +1461,12 @@ class RandomPerspective:
 
         border = labels.pop("mosaic_border", self.border)
         self.size = img.shape[1] + border[1] * 2, img.shape[0] + border[0] * 2  # w, h
-        # M is affine matrix
-        # Scale for func:`box_candidates`
-        img, M, scale = self.affine_transform(img, border)
+        
+        # Get depth map if exists
+        depth = labels.pop("depth", None)
+        
+        # M is affine matrix, Scale for func:`box_candidates`
+        img, M, scale, depth = self.affine_transform(img, border, depth)
 
         bboxes = self.apply_bboxes(instances.bboxes, M)
 
@@ -1363,6 +1492,11 @@ class RandomPerspective:
         labels["cls"] = cls[i]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
+        
+        # Add transformed depth map back to labels
+        if depth is not None:
+            labels["depth"] = depth
+        
         return labels
 
     @staticmethod
@@ -1556,11 +1690,13 @@ class RandomFlip:
                 'img' (np.ndarray): The image to be flipped.
                 'instances' (ultralytics.utils.instance.Instances): An object containing bounding boxes and
                     optionally keypoints.
+                'depth' (np.ndarray): Optional depth map corresponding to the image.
 
         Returns:
             (dict[str, Any]): The same dictionary with the flipped image and updated instances:
                 'img' (np.ndarray): The flipped image.
                 'instances' (ultralytics.utils.instance.Instances): Updated instances matching the flipped image.
+                'depth' (np.ndarray): The flipped depth map (if present in input).
 
         Examples:
             >>> labels = {"img": np.random.rand(640, 640, 3), "instances": Instances(...)}
@@ -1568,6 +1704,34 @@ class RandomFlip:
             >>> flipped_labels = random_flip(labels)
         """
         img = labels["img"]
+        
+        # Get depth map if exists
+        depth = labels.get("depth", None)
+        
+        # For depth task, no instances to flip
+        if "instances" not in labels:
+            # WARNING: two separate if and calls to random.random() intentional for reproducibility with older versions
+            if self.direction == "vertical" and random.random() < self.p:
+                img = np.flipud(img)
+                # Flip depth map vertically
+                if depth is not None:
+                    depth = np.flipud(depth)
+                    
+            if self.direction == "horizontal" and random.random() < self.p:
+                img = np.fliplr(img)
+                # Flip depth map horizontally
+                if depth is not None:
+                    depth = np.fliplr(depth)
+                    
+            labels["img"] = np.ascontiguousarray(img)
+            
+            # Update depth map
+            if depth is not None:
+                labels["depth"] = np.ascontiguousarray(depth)
+            
+            return labels
+        
+        # For detection/segmentation/pose tasks with instances
         instances = labels.pop("instances")
         instances.convert_bbox(format="xywh")
         h, w = img.shape[:2]
@@ -1580,13 +1744,325 @@ class RandomFlip:
             instances.flipud(h)
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
+            # Flip depth map vertically
+            if depth is not None:
+                depth = np.flipud(depth)
+                
         if self.direction == "horizontal" and random.random() < self.p:
             img = np.fliplr(img)
             instances.fliplr(w)
             if self.flip_idx is not None and instances.keypoints is not None:
                 instances.keypoints = np.ascontiguousarray(instances.keypoints[:, self.flip_idx, :])
+            # Flip depth map horizontally
+            if depth is not None:
+                depth = np.fliplr(depth)
+                
         labels["img"] = np.ascontiguousarray(img)
         labels["instances"] = instances
+        
+        # Update depth map
+        if depth is not None:
+            labels["depth"] = np.ascontiguousarray(depth)
+        
+        return labels
+
+
+class DirectResize:
+    """
+    Direct resize image and depth map with advanced options (inspired by Depth Anything V2).
+
+    This class resizes images and depth maps with support for aspect ratio preservation,
+    multiple-of constraints (useful for ViT models), and different interpolation methods
+    for RGB images vs depth maps. Suitable for dense prediction tasks like depth estimation.
+
+    Attributes:
+        size (tuple): Target shape (height, width) for resizing.
+        keep_aspect_ratio (bool): Whether to preserve aspect ratio during resizing.
+        ensure_multiple_of (int): Ensure output dimensions are multiples of this value.
+        resize_method (str): Method for aspect ratio preservation ("lower_bound", "upper_bound", "minimal").
+        image_interpolation (int): OpenCV interpolation method for RGB images.
+        depth_interpolation (int): OpenCV interpolation method for depth maps.
+
+    Methods:
+        __call__: Resize image and depth map, update labels accordingly.
+
+    Examples:
+        >>> # Standard direct resize (original behavior)
+        >>> transform = DirectResize(size=(640, 640))
+        >>> result = transform(labels)
+        
+        >>> # Depth Anything V2 style with aspect ratio preservation
+        >>> transform = DirectResize(
+        ...     size=(518, 518),
+        ...     keep_aspect_ratio=True,
+        ...     ensure_multiple_of=14,  # For ViT with patch size 14
+        ...     resize_method="lower_bound",
+        ...     image_interpolation=cv2.INTER_AREA,
+        ...     depth_interpolation=cv2.INTER_NEAREST
+        ... )
+        >>> result = transform(labels)
+    """
+
+    def __init__(
+        self,
+        size: tuple[int, int] = (640, 640),
+        keep_aspect_ratio: bool = False,
+        ensure_multiple_of: int = 1,
+        resize_method: str = "lower_bound",
+        image_interpolation: int = cv2.INTER_LINEAR,
+        depth_interpolation: int = cv2.INTER_LINEAR,
+    ):
+        """
+        Initialize DirectResize transform with advanced resizing options.
+
+        Args:
+            size (tuple[int, int]): Target size as (height, width).
+            keep_aspect_ratio (bool): If True, preserve aspect ratio. Output size depends on resize_method.
+            ensure_multiple_of (int): Output dimensions will be multiples of this value. Default is 1 (no constraint).
+            resize_method (str): Method when keep_aspect_ratio=True:
+                - "lower_bound": Output will be at least as large as size
+                - "upper_bound": Output will be at most as large as size
+                - "minimal": Scale as little as possible
+            image_interpolation (int): OpenCV interpolation for images (default: INTER_LINEAR).
+            depth_interpolation (int): OpenCV interpolation for depth maps (default: INTER_LINEAR).
+                                       Depth Anything V2 uses INTER_NEAREST for depth.
+        
+        Examples:
+            >>> # Original YOLO behavior
+            >>> resize = DirectResize(size=(640, 640))
+            >>> # Depth Anything V2 style for ViT models
+            >>> resize = DirectResize(
+            ...     size=(518, 518), 
+            ...     keep_aspect_ratio=True, 
+            ...     ensure_multiple_of=14,
+            ...     image_interpolation=cv2.INTER_AREA,
+            ...     depth_interpolation=cv2.INTER_NEAREST
+            ... )
+        """
+        if keep_aspect_ratio:
+            assert resize_method in {"lower_bound", "upper_bound", "minimal"}, \
+                f"resize_method must be 'lower_bound', 'upper_bound', or 'minimal', got {resize_method}"
+        
+        self.size = size  # (height, width)
+        self.keep_aspect_ratio = keep_aspect_ratio
+        self.multiple_of = ensure_multiple_of
+        self.resize_method = resize_method
+        self.image_interpolation = image_interpolation
+        self.depth_interpolation = depth_interpolation
+
+    def constrain_to_multiple_of(self, x: float, min_val: int = 0, max_val: int | None = None) -> int:
+        """
+        Constrain a value to be a multiple of self.multiple_of.
+        
+        Args:
+            x (float): Input value to constrain.
+            min_val (int): Minimum allowed value.
+            max_val (int | None): Maximum allowed value.
+        
+        Returns:
+            (int): Constrained value that is a multiple of self.multiple_of.
+        """
+        y = int(np.round(x / self.multiple_of) * self.multiple_of)
+
+        if max_val is not None and y > max_val:
+            y = int(np.floor(x / self.multiple_of) * self.multiple_of)
+
+        if y < min_val:
+            y = int(np.ceil(x / self.multiple_of) * self.multiple_of)
+
+        return y
+
+    def get_size(self, width: int, height: int) -> tuple[int, int]:
+        """
+        Calculate target size based on input dimensions and resize settings.
+        
+        Args:
+            width (int): Input image width.
+            height (int): Input image height.
+        
+        Returns:
+            (tuple[int, int]): Target (width, height) for resizing.
+        """
+        h_target, w_target = self.size
+        
+        if not self.keep_aspect_ratio:
+            # Direct resize to target size, constrained to multiple_of
+            new_height = self.constrain_to_multiple_of(h_target)
+            new_width = self.constrain_to_multiple_of(w_target)
+            return new_width, new_height
+        
+        # Calculate scale factors
+        scale_height = h_target / height
+        scale_width = w_target / width
+
+        if self.resize_method == "lower_bound":
+            # Scale such that output size is at least (w_target, h_target)
+            if scale_width > scale_height:
+                scale_height = scale_width
+            else:
+                scale_width = scale_height
+        elif self.resize_method == "upper_bound":
+            # Scale such that output size is at most (w_target, h_target)
+            if scale_width < scale_height:
+                scale_height = scale_width
+            else:
+                scale_width = scale_height
+        elif self.resize_method == "minimal":
+            # Scale as little as possible
+            if abs(1 - scale_width) < abs(1 - scale_height):
+                scale_height = scale_width
+            else:
+                scale_width = scale_height
+
+        # Calculate new dimensions with constraints
+        if self.resize_method == "lower_bound":
+            new_height = self.constrain_to_multiple_of(scale_height * height, min_val=h_target)
+            new_width = self.constrain_to_multiple_of(scale_width * width, min_val=w_target)
+        elif self.resize_method == "upper_bound":
+            new_height = self.constrain_to_multiple_of(scale_height * height, max_val=h_target)
+            new_width = self.constrain_to_multiple_of(scale_width * width, max_val=w_target)
+        else:  # minimal
+            new_height = self.constrain_to_multiple_of(scale_height * height)
+            new_width = self.constrain_to_multiple_of(scale_width * width)
+
+        return new_width, new_height
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Resize image and depth map to target size.
+
+        Args:
+            labels (dict[str, Any]): Dictionary containing image and depth data.
+
+        Returns:
+            (dict[str, Any]): Dictionary with resized image and depth.
+        """
+        img = labels.get("img")
+        if img is None:
+            return labels
+
+        # Get original shape
+        h_orig, w_orig = img.shape[:2]
+        
+        # Calculate target size (may differ from self.size if keep_aspect_ratio=True)
+        w_new, h_new = self.get_size(w_orig, h_orig)
+
+        # Resize image
+        img_resized = cv2.resize(img, (w_new, h_new), interpolation=self.image_interpolation)
+        if img_resized.ndim == 2:
+            img_resized = img_resized[..., None]
+        labels["img"] = img_resized
+        labels["resized_shape"] = (h_new, w_new)
+
+        # Resize depth map if present (use different interpolation)
+        if "depth" in labels:
+            depth = labels["depth"]
+            # Ensure depth is 2D for resizing
+            if depth.ndim == 3:
+                depth = depth[0] if depth.shape[0] == 1 else depth
+            depth_resized = cv2.resize(depth, (w_new, h_new), interpolation=self.depth_interpolation)
+            if depth_resized.ndim == 2:
+                depth_resized = depth_resized[..., None]
+            labels["depth"] = depth_resized
+
+        # Update instances if present (for detection/segmentation tasks)
+        if "instances" in labels:
+            instances = labels["instances"]
+            # Scale bounding boxes
+            instances.convert_bbox(format="xyxy")
+            instances.denormalize(w_orig, h_orig)
+            instances.scale(w_new / w_orig, h_new / h_orig)
+            instances.normalize(w_new, h_new)
+            labels["instances"] = instances
+
+        # Store ratio for later use
+        labels["ratio"] = (h_new / h_orig, w_new / w_orig)
+        
+        return labels
+
+
+class NormalizeImage:
+    """
+    Normalize image using mean and std (for depth estimation tasks).
+    
+    This class normalizes RGB images using specified mean and std values, commonly used
+    in depth estimation models that are pre-trained on ImageNet. Unlike YOLO's default
+    normalization (img/255), this applies standard normalization: (img - mean) / std.
+    
+    Attributes:
+        mean (tuple[float, float, float]): Mean values for each RGB channel.
+        std (tuple[float, float, float]): Standard deviation values for each RGB channel.
+        scale (float): Scale factor to apply before normalization (e.g., 1/255 to convert [0,255] to [0,1]).
+    
+    Methods:
+        __call__: Apply normalization to the image in labels.
+    
+    Examples:
+        >>> # ImageNet normalization (commonly used in Depth Anything, MiDaS, etc.)
+        >>> transform = NormalizeImage(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+        >>> labels = {"img": np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)}
+        >>> normalized = transform(labels)
+        >>> # Standard normalization
+        >>> transform = NormalizeImage(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        >>> normalized = transform(labels)
+    """
+
+    def __init__(
+        self,
+        mean: tuple[float, float, float] = IMAGENET_MEAN,
+        std: tuple[float, float, float] = IMAGENET_STD,
+        scale: float = 1.0 / 255.0,
+    ):
+        """
+        Initialize NormalizeImage with mean and std for image normalization.
+        
+        Args:
+            mean (tuple[float, float, float]): Mean values for RGB channels. Default is ImageNet mean.
+            std (tuple[float, float, float]): Std values for RGB channels. Default is ImageNet std.
+            scale (float): Scale factor applied before normalization. Default is 1/255 to convert [0,255] to [0,1].
+        
+        Examples:
+            >>> # ImageNet normalization
+            >>> norm = NormalizeImage()
+            >>> # Custom normalization
+            >>> norm = NormalizeImage(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), scale=1.0)
+        """
+        self.mean = np.array(mean, dtype=np.float32).reshape(1, 1, 3)
+        self.std = np.array(std, dtype=np.float32).reshape(1, 1, 3)
+        self.scale = scale
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """
+        Normalize the image in labels using mean and std.
+        
+        The normalization is applied only to the RGB image, not to depth maps.
+        Formula: normalized_img = (img * scale - mean) / std
+        
+        Args:
+            labels (dict[str, Any]): Dictionary containing 'img' key with image array.
+        
+        Returns:
+            (dict[str, Any]): Dictionary with normalized image.
+        
+        Examples:
+            >>> norm = NormalizeImage()
+            >>> labels = {"img": np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)}
+            >>> result = norm(labels)
+            >>> print(result["img"].dtype)
+            float32
+        """
+        img = labels["img"]
+        
+        # Convert to float32 if needed
+        if img.dtype != np.float32:
+            img = img.astype(np.float32)
+        
+        # Apply normalization: (img * scale - mean) / std
+        # This converts [0, 255] -> [0, 1] -> normalized
+        img = img * self.scale
+        img = (img - self.mean) / self.std
+        
+        labels["img"] = img
         return labels
 
 
@@ -1718,6 +2194,17 @@ class LetterBox:
             img = cv2.resize(img, new_unpad, interpolation=self.interpolation)
             if img.ndim == 2:
                 img = img[..., None]
+            
+            # For depth task, also resize depth map
+            if "depth" in labels:
+                depth = labels["depth"]
+                # Ensure depth is 2D before resizing
+                if depth.ndim == 3:
+                    depth = depth[0] if depth.shape[0] == 1 else depth
+                depth = cv2.resize(depth, new_unpad, interpolation=cv2.INTER_LINEAR)
+                if depth.ndim == 2:
+                    depth = depth[..., None]
+                labels["depth"] = depth
 
         top, bottom = round(dh - 0.1) if self.center else 0, round(dh + 0.1)
         left, right = round(dw - 0.1) if self.center else 0, round(dw + 0.1)
@@ -1730,6 +2217,31 @@ class LetterBox:
             pad_img = np.full((h + top + bottom, w + left + right, c), fill_value=self.padding_value, dtype=img.dtype)
             pad_img[top : top + h, left : left + w] = img
             img = pad_img
+        
+        # For depth task, also pad depth map
+        if "depth" in labels:
+            depth = labels["depth"]
+            # Ensure depth is 3D (add channel dimension if needed)
+            if depth.ndim == 2:
+                depth = depth[..., None]
+            elif depth.ndim == 3 and depth.shape[0] == 1 and depth.shape[2] != 1:
+                # Handle case where shape is (C, H, W) instead of (H, W, C)
+                depth = np.transpose(depth, (1, 2, 0))
+            
+            # CRITICAL: Depth must match image size exactly (h, w) before padding
+            # Otherwise padding will create misaligned sizes
+            if depth.shape[:2] != (h, w):
+                # Resize depth to match image size (handle rounding differences from resize)
+                depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+                if depth.ndim == 2:
+                    depth = depth[..., None]
+            
+            c_d = depth.shape[2] if depth.ndim == 3 else 1
+            # Use 0 as padding value for depth (invalid depth)
+            # Use image dimensions (h, w) for consistency
+            pad_depth = np.zeros((h + top + bottom, w + left + right, c_d), dtype=depth.dtype)
+            pad_depth[top : top + h, left : left + w] = depth
+            labels["depth"] = pad_depth
 
         if labels.get("ratio_pad"):
             labels["ratio_pad"] = (labels["ratio_pad"], (left, top))  # for evaluation
@@ -1766,10 +2278,12 @@ class LetterBox:
             >>> padw, padh = 10, 20
             >>> updated_labels = letterbox._update_labels(labels, ratio, padw, padh)
         """
-        labels["instances"].convert_bbox(format="xyxy")
-        labels["instances"].denormalize(*labels["img"].shape[:2][::-1])
-        labels["instances"].scale(*ratio)
-        labels["instances"].add_padding(padw, padh)
+        # Skip instance updates for depth tasks (which have no instances/bboxes)
+        if "instances" in labels:
+            labels["instances"].convert_bbox(format="xyxy")
+            labels["instances"].denormalize(*labels["img"].shape[:2][::-1])
+            labels["instances"].scale(*ratio)
+            labels["instances"].add_padding(padw, padh)
         return labels
 
 
@@ -2186,6 +2700,39 @@ class Format:
         """
         img = labels.pop("img")
         h, w = img.shape[:2]
+        
+        # For depth task, format image and depth map
+        if "instances" not in labels:
+            # Remove non-depth fields from labels for depth task
+            labels.pop("cls", None)
+            labels.pop("bboxes", None)
+            labels.pop("segments", None)
+            labels.pop("keypoints", None)
+            labels.pop("batch_idx", None)
+            labels.pop("obb", None)
+            labels.pop("masks", None)
+            labels["img"] = self._format_img(img)
+            # Format depth map if present
+            if "depth" in labels:
+                depth = labels["depth"]
+                # Ensure depth is numpy array
+                if isinstance(depth, torch.Tensor):
+                    depth = depth.numpy()
+                # Ensure depth has shape (H, W), then add channel dimension to get (H, W, 1)
+                if depth.ndim == 3 and depth.shape[0] == 1:
+                    # Shape is (C, H, W), convert to (H, W, C)
+                    depth = np.transpose(depth, (1, 2, 0))
+                elif depth.ndim == 3 and depth.shape[2] == 1:
+                    # Already (H, W, C)
+                    pass
+                elif depth.ndim == 2:
+                    # Shape is (H, W), add channel dimension
+                    depth = np.expand_dims(depth, axis=2)
+                # Convert (H, W, C) to (C, H, W) and then to tensor
+                depth = np.transpose(depth, (2, 0, 1))  # (H, W, C) -> (C, H, W)
+                labels["depth"] = torch.from_numpy(depth.astype(np.float32))
+            return labels
+        
         cls = labels.pop("cls")
         instances = labels.pop("instances")
         instances.convert_bbox(format=self.bbox_format)
@@ -2591,6 +3138,96 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
+        ]
+    )  # transforms
+
+
+def depth_transforms(
+    dataset, 
+    imgsz: int, 
+    hyp: IterableSimpleNamespace, 
+    stretch: bool = False,
+    keep_aspect_ratio: bool = False,
+    ensure_multiple_of: int = 1,
+    resize_method: str = "lower_bound",
+    image_interpolation: int = cv2.INTER_LINEAR,
+    depth_interpolation: int = cv2.INTER_LINEAR,
+):
+    """
+    Apply image transformations for depth estimation training.
+
+    This function creates a composition of image augmentation techniques specifically designed for
+    depth estimation tasks. Unlike detection tasks, depth estimation requires preserving the
+    absolute depth values and their physical meaning, so only safe augmentations are applied.
+
+    EXCLUDED augmentations (破坏深度信息):
+    - Mosaic: Breaks depth continuity across different scenes
+    - MixUp: Depth values lose physical meaning when blended
+    - CutMix: Inconsistent depth scales between scenes
+    - RandomPerspective: Changes depth relationships (perspective distortion)
+    - Rotation: Large angles change depth coordinate system
+    - Shear: Distorts geometric relationships
+
+    SAFE augmentations for depth estimation:
+    - Resize: Necessary for model input (with proper interpolation)
+    - RandomFlip: Horizontal/vertical flips preserve depth relationships
+    - RandomHSV: Color jittering on RGB only (helps generalization)
+
+    Args:
+        dataset (Dataset): The dataset object containing image and depth data.
+        imgsz (int): The target image size for resizing.
+        hyp (IterableSimpleNamespace): A dictionary of hyperparameters controlling various aspects of the transformations.
+        stretch (bool): If True, applies stretching to the image. If False, uses LetterBox resizing.
+        keep_aspect_ratio (bool): For DirectResize - whether to preserve aspect ratio.
+        ensure_multiple_of (int): For DirectResize - ensure output size is multiple of this value (e.g., 14 for ViT).
+        resize_method (str): For DirectResize - "lower_bound", "upper_bound", or "minimal".
+        image_interpolation (int): OpenCV interpolation for images (default: INTER_LINEAR).
+        depth_interpolation (int): OpenCV interpolation for depth (default: INTER_LINEAR, Depth Anything V2 uses INTER_NEAREST).
+
+    Returns:
+        (Compose): A composition of image transformations to be applied to the dataset.
+
+    Examples:
+        >>> from ultralytics.data.dataset import YOLODataset
+        >>> from ultralytics.utils import IterableSimpleNamespace
+        >>> dataset = YOLODataset(img_path="path/to/images", imgsz=640, task="depth")
+        >>> hyp = IterableSimpleNamespace(hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, fliplr=0.5, flipud=0.0)
+        >>> # Standard transforms
+        >>> transforms = depth_transforms(dataset, imgsz=640, hyp=hyp)
+        >>> # Depth Anything V2-style transforms (ViT-based models)
+        >>> transforms = depth_transforms(
+        ...     dataset, imgsz=518, hyp=hyp, 
+        ...     keep_aspect_ratio=True, 
+        ...     ensure_multiple_of=14,
+        ...     resize_method="lower_bound",
+        ...     image_interpolation=cv2.INTER_AREA,
+        ...     depth_interpolation=cv2.INTER_NEAREST
+        ... )
+        >>> augmented_data = transforms(dataset[0])
+    """
+    # Select resize strategy
+    # Always use DirectResize for depth estimation (LetterBox creates padding which is problematic for depth)
+    # For standard depth estimation: keep_aspect_ratio=False, stretch=True
+    # For Depth Anything V2 style: keep_aspect_ratio=True, ensure_multiple_of=14
+    resize_transform = DirectResize(
+        size=(imgsz, imgsz),
+        keep_aspect_ratio=keep_aspect_ratio,
+        ensure_multiple_of=ensure_multiple_of,
+        resize_method=resize_method,
+        image_interpolation=image_interpolation,
+        depth_interpolation=depth_interpolation,
+    )
+    
+    return Compose(
+        [
+            resize_transform,
+            # Color augmentation on RGB images only (not applied to depth maps)
+            # Helps the model generalize across different lighting conditions
+            # Always applied but with random strength from [-gain, +gain]
+            RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
+            # Horizontal flip preserves depth relationships and is safe for depth estimation
+            # Applied with probability p (default 0.5)
+            RandomFlip(direction="horizontal", p=hyp.fliplr),
         ]
     )  # transforms
 

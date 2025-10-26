@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect", "Depth"
 
 
 class Detect(nn.Module):
@@ -1234,3 +1234,110 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = nn.ModuleList([nn.Identity()] * self.nl)
+
+
+class Depth(nn.Module):
+    """
+    YOLO Depth Estimation head for monocular depth prediction.
+    
+    This head takes multi-scale features (P3, P4, P5) and fuses them to produce
+    a single-channel depth map at the original input resolution.
+    
+    Args:
+        nc (int): Number of output channels (1 for depth)
+        ch (tuple): Input channels from different feature levels
+    
+    Example:
+        >>> depth_head = Depth(nc=1, ch=(256, 512, 1024))
+        >>> features = [torch.rand(1, 256, 80, 80), torch.rand(1, 512, 40, 40), torch.rand(1, 1024, 20, 20)]
+        >>> depth_map = depth_head(features)  # (1, 1, 640, 640)
+    """
+    
+    dynamic = False
+    export = False
+    shape = None
+
+    def __init__(self, nc=1, ch=()):
+        """
+        Initialize Depth head.
+        
+        Args:
+            nc (int): Number of depth channels (typically 1)
+            ch (tuple): Channels from feature pyramid (P3, P4, P5)
+        """
+        super().__init__()
+        self.nc = nc  # depth channels
+        self.nl = len(ch)  # number of detection layers
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        
+        # 为每个尺度创建深度预测分支
+        self.cv = nn.ModuleList()
+        for x in ch:
+            self.cv.append(
+                nn.Sequential(
+                    Conv(x, x, 3),
+                    Conv(x, x // 2, 3),
+                    nn.Conv2d(x // 2, nc, 1)
+                )
+            )
+        
+        # 特征融合与上采样网络
+        # 输入: 拼接后的多尺度特征 (nc * nl channels)
+        # 输出: 原始分辨率的深度图 (nc channels)
+        fusion_channels = nc * self.nl
+        self.fusion = nn.Sequential(
+            Conv(fusion_channels, fusion_channels // 2, 3),
+            Conv(fusion_channels // 2, nc * 4, 3),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            Conv(nc * 4, nc * 2, 3),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            Conv(nc * 2, nc, 3),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(nc, nc, 3, padding=1),
+            nn.Sigmoid()  # 归一化到 [0, 1]
+        )
+
+    def forward(self, x):
+        """
+        Forward pass of Depth head.
+        
+        Args:
+            x (list[Tensor]): Feature maps from backbone [P3, P4, P5]
+                - P3: (B, C3, H/8, W/8)
+                - P4: (B, C4, H/16, W/16)
+                - P5: (B, C5, H/32, W/32)
+        
+        Returns:
+            Tensor: Depth map (B, 1, H, W) normalized to [0, 1]
+        """
+        # 对每个尺度提取深度特征
+        depth_feats = []
+        for i in range(self.nl):
+            depth_feats.append(self.cv[i](x[i]))
+        
+        # 将所有尺度的深度特征上采样到P3的尺寸
+        target_size = depth_feats[0].shape[-2:]  # P3的尺寸 (H/8, W/8)
+        depth_aligned = []
+        for feat in depth_feats:
+            if feat.shape[-2:] != target_size:
+                feat = F.interpolate(
+                    feat,
+                    size=target_size,
+                    mode='bilinear',
+                    align_corners=False
+                )
+            depth_aligned.append(feat)
+        
+        # 拼接多尺度特征
+        fused = torch.cat(depth_aligned, dim=1)  # (B, nc*3, H/8, W/8)
+        
+        # 上采样到原始分辨率并融合
+        depth_map = self.fusion(fused)  # (B, 1, H, W)
+        
+        return depth_map
+
+    def bias_init(self):
+        """Initialize Depth head biases."""
+        for cv in self.cv:
+            if hasattr(cv[-1], 'bias') and cv[-1].bias is not None:
+                nn.init.constant_(cv[-1].bias, 0.0)

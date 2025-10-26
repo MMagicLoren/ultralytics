@@ -68,6 +68,7 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    Depth,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -78,6 +79,7 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    DepthLoss,
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -1324,6 +1326,53 @@ class Ensemble(torch.nn.ModuleList):
         y = torch.cat(y, 2)  # nms ensemble, y shape(B, HW, C)
         return y, None  # inference, train output
 
+class DepthModel(BaseModel):
+    """
+    YOLO Depth Estimation model.
+    
+    This class implements monocular depth estimation for predicting pixel-level depth maps.
+    It extends BaseModel to provide specialized depth prediction capabilities.
+    """
+    def __init__(self, cfg="yolo11n-depth.yaml", ch=3, nc=None, verbose=True):
+        """
+        Initialize YOLO Depth model.
+
+        Args:
+            cfg (str | dict): Model configuration file path or dictionary.
+            ch (int): Number of input channels (default: 3 for RGB).
+            nc (int): Output channels for depth map (default: 1).
+            verbose (bool): Whether to display model information.
+        """
+        super().__init__()
+        self.yaml = cfg if isinstance(cfg, dict) else yaml_model_load(cfg)
+        
+        # Define model - similar to ClassificationModel approach
+        self.yaml["channels"] = ch
+        if nc and nc != self.yaml.get("nc", 1):
+            self.yaml["nc"] = nc
+        
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+        self.stride = torch.Tensor([32])  # Depth models typically use one stride
+        self.names = {0: "depth"}  # Single output for depth
+        
+        # Initialize args with default hyperparameters for DepthLoss
+        self.args = {
+            "imgsz": 640,
+            "depth_min": 0.0,
+            "depth_max": 1.0,
+            "lambda_l1": 1.0,
+            "lambda_si": 0.5,
+            "lambda_grad": 0.1,
+        }
+        
+        initialize_weights(self)
+        if verbose:
+            self.info()
+            LOGGER.info("")
+
+    def init_criterion(self):
+        """Initialize depth estimation loss."""
+        return DepthLoss(self)
 
 # Functions ------------------------------------------------------------------------------------------------------------
 
@@ -1681,12 +1730,12 @@ def parse_model(d, ch, verbose=True):
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, Depth}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, Depth}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
@@ -1765,7 +1814,7 @@ def guess_model_task(model):
         model (torch.nn.Module | dict): PyTorch model or model configuration in YAML format.
 
     Returns:
-        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'obb').
+        (str): Task of the model ('detect', 'segment', 'classify', 'pose', 'obb', 'depth').
     """
 
     def cfg2task(cfg):
@@ -1781,6 +1830,8 @@ def guess_model_task(model):
             return "pose"
         if m == "obb":
             return "obb"
+        if m == "depth":
+            return "depth"
 
     # Guess from model cfg
     if isinstance(model, dict):
@@ -1803,6 +1854,8 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
+            elif isinstance(m, Depth):
+                return "depth"
             elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 
@@ -1817,12 +1870,14 @@ def guess_model_task(model):
             return "pose"
         elif "-obb" in model.stem or "obb" in model.parts:
             return "obb"
+        elif "-depth" in model.stem or "depth" in model.parts:
+            return "depth"
         elif "detect" in model.parts:
             return "detect"
 
     # Unable to determine task from model
     LOGGER.warning(
         "Unable to automatically guess model task, assuming 'task=detect'. "
-        "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose' or 'obb'."
+        "Explicitly define task for your model, i.e. 'task=detect', 'segment', 'classify','pose', 'obb' or 'depth'."
     )
     return "detect"  # assume detect

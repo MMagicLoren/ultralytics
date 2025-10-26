@@ -46,6 +46,32 @@ mask_ratio: 4 # (int) mask downsample ratio (segment only)
 # Classification
 dropout: 0.0 # (float) dropout for classification head (classify only)
 
+# Depth Estimation -------------------------------------------------------------------------------------------------------
+# Depth value range
+depth_min: 0.0 # (float) minimum depth value in meters (depth tasks)
+depth_max: 255.0 # (float) maximum depth value in meters (depth tasks)
+
+# Resize settings
+resize_mode: resize # (str) resize mode: 'resize' (DirectResize), 'stretch' (no aspect ratio), 'letterbox' (with padding)
+keep_aspect_ratio: false # (bool) preserve aspect ratio during resize (Depth Anything V2 style uses true)
+ensure_multiple_of: 1 # (int) ensure output size is multiple of this value (e.g., 14 for ViT patch size)
+resize_method: lower_bound # (str) aspect ratio preservation method: 'lower_bound', 'upper_bound', or 'minimal'
+
+# Interpolation methods (OpenCV constants: INTER_NEAREST=0, INTER_LINEAR=1, INTER_CUBIC=2, INTER_AREA=3)
+image_interpolation: 1 # (int) interpolation for RGB images (1=INTER_LINEAR, 3=INTER_AREA for Depth Anything V2)
+depth_interpolation: 0 # (int) interpolation for depth maps (0=INTER_NEAREST recommended, 1=INTER_LINEAR)
+
+# Data augmentation for depth (Note: depth tasks use REDUCED augmentation to preserve depth information)
+# HSV augmentation: RandomHSV always applies, but with random strength from -gain to +gain
+# For depth estimation, use smaller values than detection tasks (detection uses hsv_h=0.015, hsv_s=0.7, hsv_v=0.4)
+# Recommended: hsv_h=0.01, hsv_s=0.3, hsv_v=0.2 for depth (more conservative)
+# Flip augmentation: fliplr is safe, flipud may change scene semantics (sky/ground)
+# Recommended: fliplr=0.5, flipud=0.0 for depth
+
+# Visualization settings (depth tasks)
+depth_vis_mode: depth_only # (str) depth map visualization mode: 'overlay', 'depth_only', 'side_by_side'
+depth_alpha: 0.7 # (float) depth map transparency for 'overlay' mode
+
 # Val/Test settings ----------------------------------------------------------------------------------------------------
 val: True # (bool) run validation/testing during training
 split: val # (str) dataset split to evaluate: 'val', 'test' or 'train'
@@ -103,6 +129,10 @@ cls: 0.5 # (float) classification loss gain
 dfl: 1.5 # (float) distribution focal loss gain
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
+depth: 1.0 # (float) depth loss gain (depth tasks)
+lambda_l1: 1.0 # (float) L1 loss weight for depth estimation
+lambda_si: 0.2 # (float) Scale-Invariant loss weight for depth estimation (reduced for relative depth)
+lambda_grad: 1.0 # (float) Gradient loss weight for depth estimation (slightly increased for edge preservation)
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction

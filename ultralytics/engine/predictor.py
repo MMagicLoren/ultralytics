@@ -47,7 +47,7 @@ import torch
 
 from ultralytics.cfg import get_cfg, get_save_dir
 from ultralytics.data import load_inference_source
-from ultralytics.data.augment import LetterBox
+from ultralytics.data.augment import LetterBox, DirectResize
 from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import DEFAULT_CFG, LOGGER, MACOS, WINDOWS, callbacks, colorstr, ops
 from ultralytics.utils.checks import check_imgsz, check_imshow
@@ -194,13 +194,37 @@ class BasePredictor:
         Returns:
             (list[np.ndarray]): List of transformed images.
         """
+        # Check if depth task and get resize mode from model's data config
+        is_depth_task = getattr(self.model, "task", None) == "depth"
+        
+        if is_depth_task:
+            # Get resize_mode from data config (default to 'resize' for depth task)
+            data_config = getattr(self.args, "data", None)
+            resize_mode = "resize"  # default
+            if data_config and isinstance(data_config, dict):
+                resize_mode = data_config.get("resize_mode", "resize")
+            elif hasattr(self.model, "model") and hasattr(self.model.model, "args"):
+                # Try to get from model's training args
+                train_data = getattr(self.model.model.args, "data", {})
+                if isinstance(train_data, dict):
+                    resize_mode = train_data.get("resize_mode", "resize")
+            
+            if resize_mode == "resize":
+                # Direct resize for depth estimation (standard approach)
+                transform = DirectResize(size=(self.imgsz, self.imgsz))
+                return [transform({"img": x})["img"] for x in im]
+        
+        # For non-depth tasks or letterbox mode, use LetterBox
         same_shapes = len({x.shape for x in im}) == 1
+        # Use padding_value=0 for depth task to clearly mark invalid/padding regions
+        padding_value = 0 if is_depth_task else 114
         letterbox = LetterBox(
             self.imgsz,
             auto=same_shapes
             and self.args.rect
             and (self.model.pt or (getattr(self.model, "dynamic", False) and not self.model.imx)),
             stride=self.model.stride,
+            padding_value=padding_value,
         )
         return [letterbox(image=x) for x in im]
 
@@ -443,13 +467,22 @@ class BasePredictor:
 
         # Add predictions to image
         if self.args.save or self.args.show:
-            self.plotted_img = result.plot(
-                line_width=self.args.line_width,
-                boxes=self.args.show_boxes,
-                conf=self.args.show_conf,
-                labels=self.args.show_labels,
-                im_gpu=None if self.args.retina_masks else im[i],
-            )
+            # Prepare plot arguments
+            plot_args = {
+                "line_width": self.args.line_width,
+                "boxes": self.args.show_boxes,
+                "conf": self.args.show_conf,
+                "labels": self.args.show_labels,
+                "im_gpu": None if self.args.retina_masks else im[i],
+            }
+            
+            # Add depth-specific arguments if available
+            if hasattr(self.args, "depth_vis_mode") and self.args.depth_vis_mode:
+                plot_args["depth_vis_mode"] = self.args.depth_vis_mode
+            if hasattr(self.args, "depth_alpha") and self.args.depth_alpha is not None:
+                plot_args["depth_alpha"] = self.args.depth_alpha
+            
+            self.plotted_img = result.plot(**plot_args)
 
         # Save results
         if self.args.save_txt:
