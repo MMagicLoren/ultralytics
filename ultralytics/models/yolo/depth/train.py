@@ -13,7 +13,7 @@ from ultralytics.engine.trainer import BaseTrainer
 from ultralytics.models import yolo
 from ultralytics.nn.tasks import DepthModel
 from ultralytics.utils import DEFAULT_CFG, LOGGER, RANK, colorstr
-from ultralytics.utils.torch_utils import torch_distributed_zero_first
+from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_model
 from ultralytics.utils.plotting import plot_images, plot_results
 
 
@@ -71,7 +71,7 @@ class DepthTrainer(BaseTrainer):
         Returns:
             (Dataset): Built dataset instance.
         """
-        gs = max(int(self.model.stride.max()), 32)  # grid size
+        gs = max(int(unwrap_model(self.model).stride.max() if self.model else 0), 32)  # grid size
         return build_yolo_dataset(
             self.args,
             img_path,
