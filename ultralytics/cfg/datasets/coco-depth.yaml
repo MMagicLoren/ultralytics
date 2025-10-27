@@ -1,0 +1,48 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Depth Estimation Dataset
+# Documentation: https://docs.ultralytics.com/tasks/depth/
+# Example usage: yolo train model=depth.yaml data=Depth.yaml
+# Dataset structure:
+# ├── train
+# │   ├── images/
+# │   └── depths/
+# ├── val
+# │   ├── images/
+# │   └── depths/
+
+
+# Dataset structure:
+# ├── images
+# │   ├── train
+# │   └── val
+# └── depths
+#     ├── train
+#     └── val
+
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: coco-pose-depth # dataset root dir
+train: images/train2017 # train images and depths (relative to 'path')
+val: images/val2017 # val images and depths (relative to 'path')
+test: # test images (optional)
+
+# Number of classes
+nc: 1
+
+# Class names
+names:
+  0: depth
+
+# Task specific settings
+task: depth # task type: depth estimation (pixel-level regression)
+
+# Depth map properties (for relative depth: 0-255 grayscale)
+depth_min: 0.0   # minimum depth value (0 for grayscale relative depth)
+depth_max: 255.0 # maximum depth value (255 for 8-bit grayscale)
+
+# Data augmentation method for depth task
+# 'resize': Direct resize to target size (standard for depth estimation, no padding)
+# 'letterbox': Resize with aspect ratio preservation and padding (YOLO style)
+# resize_mode: resize  # default to 'resize' for depth task
+
+
