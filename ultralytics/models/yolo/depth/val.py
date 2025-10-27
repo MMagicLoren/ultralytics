@@ -65,10 +65,10 @@ class DepthValidator(BaseValidator):
         Preprocess batch for depth validation.
 
         Normalizes images from [0,255] to [0,1] and moves depth data to device.
-        Also normalizes depth maps based on dataset configuration.
+        Note: Depth is already Per-image normalized to [0,1] by Format class.
 
         Args:
-            batch (dict[str, Any]): Batch containing images and depth maps.
+            batch (dict[str, Any]): Batch containing images and depth maps (already normalized to [0,1]).
 
         Returns:
             (dict[str, Any]): Preprocessed batch with normalized images and depth on device.
@@ -80,15 +80,15 @@ class DepthValidator(BaseValidator):
         batch["img"] = batch["img"].to(self.device, non_blocking=True).to(dtype) / 255.0
         
         if "depth" in batch:
+            # Depth is already Per-image normalized to [0, 1] by Format class
             batch["depth"] = batch["depth"].to(self.device).float()  # Keep depth as float32 for metrics
             
-            # Normalize depth maps to [0, 1] range based on dataset config
-            depth_min = self.data.get("depth_min", 0.0)
-            depth_max = self.data.get("depth_max", 1.0)
-            
-            if depth_max > depth_min:
-                batch["depth"] = (batch["depth"] - depth_min) / (depth_max - depth_min)
-                batch["depth"] = torch.clamp(batch["depth"], 0.0, 1.0)
+            # Store per-image min/max for denormalization during metric computation
+            # These are already in the batch from Format class
+            if "depth_min" not in batch:
+                batch["depth_min"] = 0.0  # Fallback
+            if "depth_max" not in batch:
+                batch["depth_max"] = 1.0  # Fallback
         
         return batch
 
@@ -96,28 +96,25 @@ class DepthValidator(BaseValidator):
         """
         Postprocess depth predictions.
 
-        Denormalize predictions from [0, 1] to original depth range for evaluation.
+        Keep predictions in normalized [0,1] scale for metric computation.
+        Conversion to [0,255] happens during visualization only.
 
         Args:
             preds (torch.Tensor): Raw depth predictions from model (normalized to [0, 1]).
 
         Returns:
-            (torch.Tensor): Postprocessed depth predictions in original depth range.
+            (torch.Tensor): Depth predictions in normalized [0,1] scale for metrics.
         """
         # preds shape: (batch_size, 1, height, width)
-        # Ensure it's on CPU and detached for metric computation
+        # Model outputs are already in [0, 1] range (Per-image normalized)
+        # Keep in [0,1] for metrics computation
         if isinstance(preds, list):
             preds = preds[0]
         
         preds = preds.detach()
         
-        # Denormalize predictions to original depth range for meaningful metrics
-        depth_min = self.data.get("depth_min", 0.0)
-        depth_max = self.data.get("depth_max", 1.0)
-        
-        if depth_max > depth_min:
-            preds = preds * (depth_max - depth_min) + depth_min
-        
+        # Keep in [0, 1] range for metric computation
+        # Visualization will convert to [0, 255] when needed
         return preds
 
     def init_metrics(self, model: torch.nn.Module) -> None:
@@ -134,16 +131,16 @@ class DepthValidator(BaseValidator):
         Update depth estimation metrics with predictions and ground truth.
 
         Args:
-            preds (torch.Tensor): Model predictions with shape (B, 1, H, W).
-            batch (dict[str, Any]): Batch containing ground truth depth and image info.
+            preds (torch.Tensor): Model predictions with shape (B, 1, H, W), already in [0,1] normalized range.
+            batch (dict[str, Any]): Batch containing ground truth depth (normalized [0,1]) and image info.
         """
         if "depth" not in batch:
             LOGGER.warning("No depth ground truth in batch, skipping metrics update")
             return
 
         # Ensure predictions and ground truth have compatible shapes
-        pred_depth = preds  # (B, 1, H, W)
-        gt_depth = batch["depth"]  # (B, 1, H, W) or (B, H, W)
+        pred_depth = preds  # (B, 1, H, W) - normalized [0, 1]
+        gt_depth = batch["depth"]  # (B, 1, H, W) or (B, H, W) - normalized [0, 1]
 
         # Handle dimension mismatches
         if pred_depth.dim() == 3:
@@ -161,20 +158,16 @@ class DepthValidator(BaseValidator):
             )
 
         # Process each sample in batch
-        # Compute metrics in normalized scale [0, 1] for consistency with literature
+        # Both pred and gt are in normalized [0, 1] scale (Per-image normalized)
+        # Compute metrics in normalized scale for consistency
         # This makes MAE/RMSE values directly interpretable as relative errors
-        depth_min = self.data.get("depth_min", 0.0)
-        depth_max = self.data.get("depth_max", 1.0)
         
         for i in range(pred_depth.shape[0]):
-            pred = pred_depth[i].squeeze().cpu().numpy()  # (H, W) - denormalized by postprocess
-            gt = gt_depth[i].squeeze().cpu().numpy()  # (H, W) - normalized [0, 1]
+            # Both are already in [0, 1] range from Per-image normalization
+            pred = pred_depth[i].squeeze().cpu().numpy()  # (H, W) - [0, 1] normalized
+            gt = gt_depth[i].squeeze().cpu().numpy()  # (H, W) - [0, 1] normalized
             
-            # Re-normalize predictions to [0, 1] to match GT scale
-            # This ensures MAE/RMSE are in normalized scale for better comparison with literature
-            if depth_max > depth_min:
-                pred = (pred - depth_min) / (depth_max - depth_min)
-            
+            # Compute metrics directly on normalized scale [0, 1]
             self.metrics.process(pred, gt)
 
     def finalize_metrics(self) -> None:
@@ -254,32 +247,33 @@ class DepthValidator(BaseValidator):
         Plot validation samples with ground truth depth maps.
 
         Args:
-            batch (dict[str, Any]): Batch containing images and depth ground truth.
+            batch (dict[str, Any]): Batch containing images and depth ground truth (normalized [0,1]).
             ni (int): Batch index for file naming.
         """
         if "depth" in batch:
-            # Get depth range for visualization
-            depth_min = self.data.get("depth_min", 0.0)
-            depth_max = self.data.get("depth_max", 255.0)
-            
-            # Denormalize GT depth to original range for visualization
+            # GT depth is already Per-image normalized to [0, 1]
+            # Convert to [0, 255] for visualization
             gt_depth = batch["depth"]  # normalized [0, 1]
             if isinstance(gt_depth, torch.Tensor):
                 gt_depth = gt_depth.clone()
-            if depth_max > depth_min:
-                gt_depth = gt_depth * (depth_max - depth_min) + depth_min
+            else:
+                gt_depth = torch.from_numpy(gt_depth).float()
+            
+            # Convert [0, 1] to [0, 255] for visualization
+            gt_depth_vis = gt_depth * 255.0
+            gt_depth_vis = torch.clamp(gt_depth_vis, 0.0, 255.0)
             
             plot_images(
                 labels={
                     "img": batch["img"],
-                    "depths": gt_depth,
+                    "depths": gt_depth_vis,
                     "im_file": batch.get("im_file", []),
                 },
                 paths=batch.get("im_file"),
                 fname=self.save_dir / f"val_batch{ni}_labels.jpg",
                 names={0: "ground_truth_depth"},
                 on_plot=self.on_plot,
-                depth_range=(depth_min, depth_max),  # Use fixed range for consistent comparison
+                depth_range=(0.0, 255.0),  # Visualization range [0, 255]
             )
 
     def plot_predictions(self, batch: dict[str, Any], preds: torch.Tensor, ni: int) -> None:
@@ -289,27 +283,22 @@ class DepthValidator(BaseValidator):
         Args:
             batch (dict[str, Any]): Batch containing images.
             preds (torch.Tensor): Predicted depth maps with shape (B, 1, H, W).
-                                 Already denormalized to original depth range [0, 255] by postprocess.
+                                 In normalized [0,1] scale (for metrics computation).
             ni (int): Batch index for file naming.
         """
-        # No masking - show predictions as-is
-        # For letterbox mode, padding regions will show predictions (which is fine for visualization)
-        # For resize mode, no padding exists anyway
+        # Convert predictions from [0,1] to [0,255] for visualization
+        preds_vis = preds * 255.0
+        preds_vis = torch.clamp(preds_vis, 0.0, 255.0)
         
-        # Get depth range for consistent visualization with GT
-        depth_min = self.data.get("depth_min", 0.0)
-        depth_max = self.data.get("depth_max", 255.0)
-        
-        # Use fixed range to enable fair comparison with GT
         plot_images(
             labels={
                 "img": batch["img"],
-                "depths": preds,  # Already in [0, 255] range from postprocess
+                "depths": preds_vis,
                 "im_file": batch.get("im_file", []),
             },
             paths=batch.get("im_file"),
             fname=self.save_dir / f"val_batch{ni}_pred.jpg",
             names={0: "predicted_depth"},
             on_plot=self.on_plot,
-            depth_range=(depth_min, depth_max),  # Use same fixed range as GT for fair comparison
+            depth_range=(0.0, 255.0),  # Visualization range [0, 255]
         )

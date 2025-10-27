@@ -2,7 +2,7 @@ from ultralytics import YOLO
 
 if __name__ == "__main__":
     source = r"E:\datasets\coco128-depth\val\images"
-    model = YOLO(r"E:\WorkSpace\ultralytics\ultralytics\runs\depth\train\weights\best.pt")
+    model = YOLO(r"E:\WorkSpace\ultralytics\ultralytics\runs\depth\train3\weights\best.pt")
 
     # ============================================================================
     # 方式1: 在 model.predict() 中直接指定 depth_vis_mode 和 depth_alpha

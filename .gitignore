@@ -174,3 +174,8 @@ pnnx*
 
 # calibration image
 calibration_*.npy
+
+ultralytics/predict.py
+ultralytics/test.py
+ultralytics/train.py
+ultralytics/val.py

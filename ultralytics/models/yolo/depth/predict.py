@@ -48,18 +48,15 @@ class DepthPredictor(BasePredictor):
         
         Args:
             preds (torch.Tensor): Predicted depth maps from the model, shape (B, 1, H, W) or (B, C, H, W).
+                                 Model outputs are in normalized [0, 1] range (Per-image normalized).
             img (torch.Tensor): Preprocessed input images.
             orig_imgs (list | np.ndarray): Original input images.
         
         Returns:
-            (list[Results]): List of Results objects containing depth maps.
+            (list[Results]): List of Results objects containing depth maps in [0, 255] for visualization.
         """
         if not isinstance(orig_imgs, list):
             orig_imgs = ops.convert_torch2numpy_batch(orig_imgs)
-
-        # Get depth range for denormalization (from model args or defaults)
-        depth_min = getattr(self.model, 'args', {}).get('depth_min', 0.0)
-        depth_max = getattr(self.model, 'args', {}).get('depth_max', 255.0)
 
         results = []
         for i, depth_map in enumerate(preds):
@@ -82,10 +79,10 @@ class DepthPredictor(BasePredictor):
                     align_corners=False,
                 ).squeeze()
             
-            # Denormalize depth from [0, 1] to original range [depth_min, depth_max]
-            # This ensures consistent visualization with val_batch_pred.jpg
-            if depth_max > depth_min:
-                depth_map = depth_map * (depth_max - depth_min) + depth_min
+            # Convert model output from [0, 1] to [0, 255] for visualization
+            # Model output is already Per-image normalized to [0, 1]
+            depth_map = depth_map * 255.0
+            depth_map = torch.clamp(depth_map, 0.0, 255.0)
             
             # Convert to numpy
             depth_map_np = depth_map.detach().cpu().numpy()
