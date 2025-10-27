@@ -424,9 +424,34 @@ class YOLODataset(BaseDataset):
         
         # First try to find depth file in common locations
         depth_file = None
-        for loc_base in [Path(im_file).parent.parent / "depths", Path(im_file).parent]:
+        
+        # Build list of candidate depth directories based on image path structure
+        # Support both directory structures:
+        # 1. train/images/ and train/depths/ (sibling directories under train/)
+        # 2. images/train/ and depths/train/ (parallel directory trees)
+        candidate_dirs = []
+        
+        im_path = Path(im_file)
+        im_parent = im_path.parent
+        
+        # Structure 1: train/images/xxx.jpg -> train/depths/xxx.png
+        candidate_dirs.append(im_parent.parent / "depths")
+        
+        # Structure 2: images/train/xxx.jpg -> depths/train/xxx.png
+        if im_parent.parent.name in ["images", "imgs"]:
+            # Image is in images/train or images/val, so depths should be in depths/train or depths/val
+            depth_subdir = im_parent.name  # 'train' or 'val'
+            candidate_dirs.append(im_parent.parent.parent / "depths" / depth_subdir)
+        
+        # Fallback: same directory as image
+        candidate_dirs.append(im_parent)
+        
+        # Remove duplicates while preserving order
+        candidate_dirs = list(dict.fromkeys(candidate_dirs))
+        
+        for loc_base in candidate_dirs:
             for ext in depth_extensions:
-                candidate = loc_base / (Path(im_file).stem + ext)
+                candidate = loc_base / (im_path.stem + ext)
                 if candidate.exists():
                     depth_file = candidate
                     break
