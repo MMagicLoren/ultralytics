@@ -271,9 +271,20 @@ class YOLODataset(BaseDataset):
             # DirectResize: Standard for depth estimation, can use Depth Anything V2-style options
             # LetterBox: YOLO style, preserve aspect ratio with padding
             resize_mode = self.data.get("resize_mode", "resize")  # default to 'resize'
+            aspect_ratio = self.data.get("keep_aspect_ratio", False)
+            LOGGER.info(f"🎯 Depth transforms: mode={resize_mode}, aspect_ratio={aspect_ratio}, aug={self.augment}, stage={'train' if self.augment else 'val'}")
             
-            if self.augment:
-                # Apply depth-specific augmentations
+            if resize_mode == "letterbox":
+                # LetterBox mode for both training and validation
+                transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False, padding_value=0)])
+                
+                if self.augment:
+                    # Add augmentations before letterbox
+                    from .augment import RandomHSV, RandomFlip
+                    transforms.insert(0, RandomHSV(hgain=0.015, sgain=0.7, vgain=0.4))
+                    transforms.insert(1, RandomFlip(p=0.5))
+            elif self.augment:
+                # Apply depth-specific augmentations with DirectResize
                 # Support for Depth Anything V2-style resize parameters
                 stretch = resize_mode == "stretch"  # Direct resize without any aspect ratio preservation
                 keep_aspect_ratio = self.data.get("keep_aspect_ratio", False)
@@ -325,7 +336,7 @@ class YOLODataset(BaseDataset):
                     )
                 ])
             else:
-                # LetterBox with padding (use padding_value=0 for depth to mark invalid regions)
+                # Default fallback: LetterBox
                 transforms = Compose([LetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False, padding_value=0)])
             
             transforms.append(

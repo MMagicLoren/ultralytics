@@ -43,6 +43,7 @@ depth_max: 255.0 # maximum depth value (255 for 8-bit grayscale)
 # Data augmentation method for depth task
 # 'resize': Direct resize to target size (standard for depth estimation, no padding)
 # 'letterbox': Resize with aspect ratio preservation and padding (YOLO style)
-# resize_mode: resize  # default to 'resize' for depth task
+# 'stretch': Direct resize without aspect ratio preservation
+# resize_mode: letterbox  # default to 'resize' for depth task; can be overridden in training args
 
 

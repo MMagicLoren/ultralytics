@@ -229,6 +229,20 @@ def build_yolo_dataset(
     multi_modal: bool = False,
 ):
     """Build and return a YOLO dataset based on configuration parameters."""
+    # ✅ Merge depth-related parameters from cfg into data dict for depth tasks
+    # This allows command-line args (cfg) to override data.yaml for depth configuration
+    if data.get("task") == "depth":
+        depth_params = [
+            "resize_mode", "keep_aspect_ratio", "ensure_multiple_of", "resize_method",
+            "image_interpolation", "depth_interpolation", "depth_min", "depth_max"
+        ]
+        for param in depth_params:
+            if hasattr(cfg, param):
+                cfg_value = getattr(cfg, param)
+                # Use cfg value if: (1) data doesn't have it, or (2) cfg explicitly differs from hardcoded default
+                if param not in data or (cfg_value is not None):
+                    data[param] = cfg_value
+    
     dataset = YOLOMultiModalDataset if multi_modal else YOLODataset
     return dataset(
         img_path=img_path,
